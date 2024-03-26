@@ -26,6 +26,7 @@ from database import Session
 from models import User
 
 
+# aboba
 class UserContext:
     """
     Class user context
