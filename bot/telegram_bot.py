@@ -42,13 +42,12 @@ class UserContext:
         with Session() as session:
             user = session.query(User).filter(User.id == user_id).first()
 
-            if user.name == new_name:
-                return
-
             if not user:
                 new_user = User(id=user_id, name=new_name)
                 session.add(new_user)
             else:
+                if user.name == new_name:
+                    return
                 user.name = new_name
 
             self._name = new_name
@@ -372,7 +371,8 @@ class ChatGPTTelegramBot:
         chat_id = update.message.chat_id
         user_id = update.message.from_user.id
 
-        seo_query = f"Создай seo оптимизацию для видео на YouTube по заданию ниже. Придумай 3 названия для видеоролика на YouTube по теме {user_input}. Придумай описание к видео на YouTube по теме {user_input} :: Результат представь в следующем виде. Описание должно состоять из 3 абзацев, первый должен отражать содержание и содержать ключевые слова для выдачи в поиске. Количество предложений от 5 до 6. Второй рассказывает про ролик и так же содержит ключевые слова для seo, количество предложений от 7 до 10. В третьем абзаце должно рассказывать о канале, количество предложений от 7 до 10. В конце описания должно быть 5 хэштегов по теме видео, каждый хэштег - 1 слово. В Четвертом абзаце укажи 20 тегов от 1 до 3 слов по теме видео. Некоторые теги могут начинать со слова “как”, теги должны идти единым текстовым блоком, через запятую. :: В пятом абзаце придумай 3 идеи концепции для превью картинок на YouTube, какое должно быть фото на фоне, какого цвета фон, какие элементы расположить на картинке и какой должен быть указан текст. В шестом абзаце напиши, укажи ссылки на соцсети"
+        seo_query = f"Создай seo оптимизацию для видео на YouTube по заданию ниже. Придумай 3 названия для видеоролика на YouTube по теме {user_input} Придумай описание к видео на YouTube по теме {user_input} :: Результат представь в следующем виде. Описание должно состоять из 3 абзацев, первый должен отражать содержание и содержать ключевые слова для выдачи в поиске. Количество предложений от 5 до 6. Второй рассказывает про ролик и так же содержит ключевые слова для seo, количество предложений от 7 до 10. В третьем абзаце должно рассказывать о канале, количество предложений от 7 до 10. После этого укажи ссылки на социальные сети. В конце описания должно быть 5 хэштегов по теме видео, каждый хэштег - 1 слово. В Четвертом абзаце укажи 20 тегов от 1 до 3 слов по теме видео. Некоторые теги могут начинать со слова “как”, теги должны идти единым текстовым блоком, через запятую. :: В пятом абзаце придумай 3 идеи концепции для превью картинок на YouTube, какое должно быть фото на фоне, какого цвета фон, какие элементы расположить на картинке и какой должен быть указан текст.."
+        # seo_query = f"Создай seo оптимизацию для видео на YouTube по заданию ниже. Придумай 3 названия для видеоролика на YouTube по теме {user_input}. Придумай описание к видео на YouTube по теме {user_input} :: Результат представь в следующем виде. Описание должно состоять из 3 абзацев, первый должен отражать содержание и содержать ключевые слова для выдачи в поиске. Количество предложений от 5 до 6. Второй рассказывает про ролик и так же содержит ключевые слова для seo, количество предложений от 7 до 10. В третьем абзаце должно рассказывать о канале, количество предложений от 7 до 10. В конце описания должно быть 5 хэштегов по теме видео, каждый хэштег - 1 слово. В Четвертом абзаце укажи 20 тегов от 1 до 3 слов по теме видео. Некоторые теги могут начинать со слова “как”, теги должны идти единым текстовым блоком, через запятую. :: В пятом абзаце придумай 3 идеи концепции для превью картинок на YouTube, какое должно быть фото на фоне, какого цвета фон, какие элементы расположить на картинке и какой должен быть указан текст. В шестом абзаце напиши, укажи ссылки на соцсети"
 
         shorts_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=seo_query)
         await update.message.reply_text(
@@ -1442,23 +1442,23 @@ class ChatGPTTelegramBot:
             .concurrent_updates(True) \
             .build()
 
+        application.add_handler(CommandHandler('start', self.start))
         application.add_handler(CommandHandler('shorts', self.shorts))
         application.add_handler(CommandHandler('seo', self.seo))
         application.add_handler(CommandHandler('video', self.video))
         application.add_handler(CommandHandler('restart', self.restart))
 
-        application.add_handler(CommandHandler('reset', self.reset))
-        application.add_handler(CommandHandler('help', self.help))
-        application.add_handler(CommandHandler('image', self.image))
-        application.add_handler(CommandHandler('tts', self.tts))
-        application.add_handler(CommandHandler('start', self.start))
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.handle_message))
         application.add_handler(CallbackQueryHandler(self.handle_callback_query))
-        application.add_handler(CommandHandler('stats', self.stats))
-        application.add_handler(CommandHandler('resend', self.resend))
-        application.add_handler(CommandHandler(
-            'chat', self.prompt, filters=filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
-        )
+        # application.add_handler(CommandHandler('reset', self.reset))
+        # application.add_handler(CommandHandler('help', self.help))
+        # application.add_handler(CommandHandler('image', self.image))
+        # application.add_handler(CommandHandler('tts', self.tts))
+        # application.add_handler(CommandHandler('stats', self.stats))
+        # application.add_handler(CommandHandler('resend', self.resend))
+        # application.add_handler(CommandHandler(
+        #     'chat', self.prompt, filters=filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
+        # )
         # application.add_handler(MessageHandler(
         #     filters.PHOTO | filters.Document.IMAGE,
         #     self.vision))
@@ -1467,9 +1467,9 @@ class ChatGPTTelegramBot:
         #     filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO,
         #     self.transcribe))
         # application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.prompt))
-        application.add_handler(InlineQueryHandler(self.inline_query, chat_types=[
-            constants.ChatType.GROUP, constants.ChatType.SUPERGROUP, constants.ChatType.PRIVATE
-        ]))
+        # application.add_handler(InlineQueryHandler(self.inline_query, chat_types=[
+        #     constants.ChatType.GROUP, constants.ChatType.SUPERGROUP, constants.ChatType.PRIVATE
+        # ]))
         # application.add_handler(CallbackQueryHandler(self.handle_callback_inline_query))
 
         application.add_error_handler(error_handler)

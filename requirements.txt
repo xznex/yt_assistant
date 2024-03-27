@@ -1,10 +1,11 @@
+wheel
 python-dotenv
 pydub
 tiktoken
 openai
 sqlalchemy
 python-telegram-bot
-psycopg2
+psycopg2-binary
 requests
 tenacity
 wolframalpha
