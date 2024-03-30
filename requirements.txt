@@ -15,3 +15,4 @@ pytube
 gtts
 whois
 Pillow
+youtube-transcript-api
