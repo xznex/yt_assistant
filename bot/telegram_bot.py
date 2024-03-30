@@ -4,6 +4,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 from uuid import uuid4
 
 from PIL import Image
@@ -21,6 +22,8 @@ from utils import is_group_chat, get_thread_id, message_text, wrap_with_indicato
     edit_message_with_retry, get_stream_cutoff_values, is_allowed, get_remaining_budget, is_within_budget, \
     get_reply_to_message_id, add_chat_request_to_usage_tracker, error_handler, is_direct_result, handle_direct_result, \
     cleanup_intermediate_files
+from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled, \
+    TranslationLanguageNotAvailable
 
 from database import Session
 from models import User
@@ -53,20 +56,46 @@ class UserContext:
             self._name = new_name
             session.commit()
 
-    def save_description_and_idea(self, user_id, new_description, new_idea):
+    def save_description(self, user_id, new_description):
         with Session() as session:
             user = session.query(User).filter(User.id == user_id).first()
 
             if not user:
-                new_user = User(id=user_id, channel_description=new_description, channel_idea=new_idea)
+                new_user = User(id=user_id, channel_description=new_description)
                 session.add(new_user)
             else:
                 user.channel_description = new_description
-                user.channel_idea = new_idea
 
             self._channel_description = new_description
+            session.commit()
+
+    def save_idea(self, user_id, new_idea):
+        with Session() as session:
+            user = session.query(User).filter(User.id == user_id).first()
+
+            if not user:
+                new_user = User(id=user_id, channel_idea=new_idea)
+                session.add(new_user)
+            else:
+                user.channel_idea = new_idea
+
             self._channel_idea = new_idea
             session.commit()
+
+    # def save_description_and_idea(self, user_id, new_description, new_idea):
+    #     with Session() as session:
+    #         user = session.query(User).filter(User.id == user_id).first()
+    #
+    #         if not user:
+    #             new_user = User(id=user_id, channel_description=new_description, channel_idea=new_idea)
+    #             session.add(new_user)
+    #         else:
+    #             user.channel_description = new_description
+    #             user.channel_idea = new_idea
+    #
+    #         self._channel_description = new_description
+    #         self._channel_idea = new_idea
+    #         session.commit()
 
 
 class ChatGPTTelegramBot:
@@ -84,18 +113,19 @@ class ChatGPTTelegramBot:
         self.openai = openai
         bot_language = self.config['bot_language']
         self.commands = [
-            BotCommand(command='help', description=localized_text('help_description', bot_language)),
-            BotCommand(command='reset', description=localized_text('reset_description', bot_language)),
-            BotCommand(command='stats', description=localized_text('stats_description', bot_language)),
-            BotCommand(command='resend', description=localized_text('resend_description', bot_language))
+            BotCommand(command='naming', description="Упаковка канала"),
+            BotCommand(command='video', description="Создать сценарий видео"),
+            BotCommand(command='shorts', description="Создать сценарий shorts"),
+            BotCommand(command='seo', description="Придумать название и описание к видео"),
+            BotCommand(command='restart', description="Перезапуск бота"),
         ]
         # If imaging is enabled, add the "image" command to the list
-        if self.config.get('enable_image_generation', False):
-            self.commands.append(
-                BotCommand(command='image', description=localized_text('image_description', bot_language)))
+        # if self.config.get('enable_image_generation', False):
+        #     self.commands.append(
+        #         BotCommand(command='image', description=localized_text('image_description', bot_language)))
 
-        if self.config.get('enable_tts_generation', False):
-            self.commands.append(BotCommand(command='tts', description=localized_text('tts_description', bot_language)))
+        # if self.config.get('enable_tts_generation', False):
+        #     self.commands.append(BotCommand(command='tts', description=localized_text('tts_description', bot_language)))
 
         self.group_commands = [BotCommand(
             command='chat', description=localized_text('chat_description', bot_language)
@@ -115,9 +145,9 @@ class ChatGPTTelegramBot:
 
         await context.bot.send_photo(chat_id=chat_id, photo='start_photo.jpg')
         await update.message.reply_text(
-            "Привет, я твой карманный YouTube продюсер 👋🏻\n"
-            "Создатель назвал меня Сильвия, но для тебя я буду ассистентом по старту твоего канала на YouTube 🎥\n"
-            "Я существую, чтобы ты сэкономил сотни тысяч рублей на найме команды или на дорогом продакшне и начал получать первые просмотры уже сегодня вечером❤️\n"
+            "Привет, я твой карманный YouTube продюсер 👋🏻\n\n"
+            "Создатель назвал меня Сильвия, но для тебя я буду ассистентом по старту твоего канала на YouTube 🎥\n\n"
+            "Я существую, чтобы ты сэкономил сотни тысяч рублей на найме команды или на дорогом продакшне и начал получать первые просмотры уже сегодня вечером❤️\n\n"
             "Я придумаю за тебя сценарии и даже пропишу теги к видео, тебе останется лишь снять и выложить ролик 😻",
         )
         await update.message.reply_text(
@@ -128,6 +158,7 @@ class ChatGPTTelegramBot:
         self.user_states[update.effective_chat.id] = 'waiting_for_name'
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.message.from_user.id
         state = self.user_states.get(update.effective_chat.id)
         chat_id = update.effective_chat.id
         if state == 'waiting_for_name':
@@ -144,7 +175,7 @@ class ChatGPTTelegramBot:
 
             # self.user_names[update.effective_chat.id] = update.message.text
             # Меняем состояние
-            self.user_states[update.effective_chat.id] = 'asking_about_channel'
+            self.user_states[update.effective_chat.id] = 'awaiting_channel_description'
             # Задаем вопрос о канале
             keyboard = [
                 [InlineKeyboardButton("Уже есть", callback_data='channel_exists')],
@@ -159,7 +190,6 @@ class ChatGPTTelegramBot:
         elif state == 'awaiting_channel_description':
             # Принимаем текст от пользователя
             user_input = update.message.text
-            # СЮДА ВСТАВИТЬ
             await self.to_continue_or_see_features(update, context, user_input)
 
             # Вызываем функцию continue_or_see_features и передаем ей введенный текст
@@ -170,10 +200,29 @@ class ChatGPTTelegramBot:
             await self.turnkey_generation(update, context, user_description=user_input)
         elif state == 'waiting_for_seo':
             user_input = update.message.text
+            await self.seo_handler(update, context, user_input)
+        elif state == 'create_new_video_handler':
+            user_input = update.message.text
+            await update.message.reply_text(
+                "Отлично! Ушла писать сценарий! 😇"
+            )
+            await self.create_new_video_handler(update, context, user_input)
+        elif state == 'create_new_shorts_handler':
+            user_input = update.message.text
             await update.message.reply_text(
                 "Отлично! Ушла писать сценарии! 😇"
             )
-            await self.seo_handler(update, context, user_input)
+            await self.create_new_shorts_handler(update, context, user_input)
+        if state == "awaiting_correct_url":
+            try:
+                # Try processing the URL again
+                await self.seo_handler(update, context, update.message.text)
+                # If successful, reset the user's state
+                self.user_states[user_id] = "normal"
+            except ValueError as e:
+                # If still invalid, inform the user and wait for another attempt
+                await context.bot.send_message(chat_id=update.message.chat_id,
+                                               text="Некорректный URL. Пожалуйста, введи правильную ссылку на видео YouTube.")
 
     # Да, все callback-запросы, созданные в вашем боте, будут перенаправляться в handle_callback_query.
     # Ваша задача — в этой функции различать идентификаторы (callback data) этих запросов и реагировать на них
@@ -193,13 +242,17 @@ class ChatGPTTelegramBot:
             # await self.to_continue_or_see_features(update, context)
             # await self.left_to_develop(update, context)
             await update.callback_query.message.reply_text(
-                "Отлично, уже ушла разрабатывать концепцию для названия твоего канала, а пока ты можешь еще кое с чем мне помочь. Напиши от 10 до 40 слов, которыми можно описать идею твоего канала, это сильно поможет нам выводить наши ролик в топы запросов зрителей в будущем 😍"
+                "Отлично, уже ушла разрабатывать концепцию для названия твоего канала, а пока ты можешь еще кое с чем мне помочь. \n\nНапиши от 10 до 40 слов, которыми можно описать идею твоего канала, это сильно поможет нам выводить наши ролик в топы запросов зрителей в будущем 😍"
             )
             await self.turnkey_generation(update, context)
         elif query.data == "view_features":
             await self.view_features(update, context)
         elif query.data == "start_creating_video":
             await self.congratulations_with_readiness(update, context)
+        elif query.data == "create_new_video":
+            await self.create_new_video(update, context)
+        elif query.data == "create_new_shorts":
+            await self.create_new_shorts(update, context)
 
     async def couple_of_questions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Ваша логика для обработки ситуации, когда у пользователя уже есть канал
@@ -218,7 +271,7 @@ class ChatGPTTelegramBot:
 
     async def input_channel_packaging(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.message.reply_text(
-            "Класс, давай начнем с упаковки канала и я придумаю тебе название и описание. Расскажи мне в 2-3х предложениях о чем твой канал? Постарайся раскрыться максимально подробно, это правда важно ❤️"
+            "Класс, давай начнем с упаковки канала и я придумаю тебе название и описание. Расскажи мне в 2-3х предложениях о чем твой канал?\n\nПостарайся раскрыться максимально подробно, это правда важно ❤️"
         )
         await update.callback_query.message.reply_text(
             "Напиши мне сообщения, начиная с \"О...\"\n\nНапример: О том, как помогать людям избавляться от тревожности с помощью трансовые техник и как стать более счастливым и ментально здоровым человеком. Мой канал про психологию, мышление и психическое здоровье. Про..."
@@ -227,6 +280,18 @@ class ChatGPTTelegramBot:
 
     async def to_continue_or_see_features(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_input: str):
         # Просто выводим обратно текст, полученный от пользователя
+        # Сохраняем описание
+        user_id = update.message.from_user.id
+        chat_id = update.effective_chat.id
+        if chat_id not in self.user_contexts:
+            user_context = UserContext()
+            self.user_contexts[chat_id] = user_context
+        else:
+            user_context = self.user_contexts[chat_id]
+
+        user_context.save_description(user_id, user_input)
+        # user_context.save_description_and_idea(chat_id, user_description, user_input)
+
         keyboard = [
             [InlineKeyboardButton("Канал \"Под ключ\"", callback_data='turnkey_channel')],
             [InlineKeyboardButton("Посмотреть функции", callback_data='view_features')]
@@ -260,28 +325,28 @@ class ChatGPTTelegramBot:
             "Отлично, через 30 секунд вернусь к тебе с идеями с названием и с описанием канала, никуда не уходи!"
         )
 
-        # Сохранение в БД
+        # Сохранение idea
         if chat_id not in self.user_contexts:
             user_context = UserContext()
             self.user_contexts[chat_id] = user_context
         else:
             user_context = self.user_contexts[chat_id]
 
-        user_context.save_description_and_idea(chat_id, user_description, user_input)
+        user_context.save_idea(chat_id, user_input)
 
-        titles_prompt = f"Придумай 50 версий названий для YouTube канала {user_input}. В названии должно содержаться от 2 до 4 слов, отражающих тематику канала, но они должны выглядеть как целостная фраза.На русском языке"
-        description_prompt = f"Напиши описание к ютуб каналу про {user_description} В описании должно быть 400 слов. Укажи подробности о том, какой контент здесь люди смогут посмотреть и добавь призывы на подписку на канал и укажи, кому точно стоит оставаться на канале и смотреть его регулярно, чтобы не пропустить новых видео"
+        titles_prompt = f"Придумай 50 версий названий для YouTube канала {user_input}. В названии должно содержаться от 2 до 4 слов, отражающих тематику канала, но они должны выглядеть как целостная фраза. Пожалуйста, кроме 50 названий ничего больше не пиши в этом ответе. На русском языке"
+        description_prompt = f"Напиши описание к ютуб каналу про {user_description} В описании должно быть 400 слов. Укажи подробности о том, какой контент здесь люди смогут посмотреть и добавь призывы на подписку на канал и укажи, кому точно стоит оставаться на канале и смотреть его регулярно, чтобы не пропустить новых видео. Ответ должен быть на Русском языке."
         titles_response, titles_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=titles_prompt)
         description_response, description_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=description_prompt)
+        # await update.message.reply_text(
+        #     f"Придумала для тебя 50 идей для названия, выбери любое понравившееся 👇\n\n{user_input}"
+        # )
         await update.message.reply_text(
-            f"Придумала для тебя 50 идей для названия, выбери любое понравившееся 👇\n\n{user_input}"
+            f"Придумала для тебя 50 идей для названия, выбери любое понравившееся 👇\n\n{str(titles_response)}"
         )
-        await update.message.reply_text(
-            str(titles_response)
-        )
-        await update.message.reply_text(
-            "А вот и описание для канала! Можешь просто скопировать и вставить его. Кстати, я прикрепила ниже инструкцию, как это сделать 👇"
-        )
+        # await update.message.reply_text(
+        #     f"А вот и описание для канала! Можешь просто скопировать и вставить его. Кстати, я прикрепила ниже инструкцию, как это сделать 👇"
+        # )
 
         keyboard = [
             [InlineKeyboardButton("Приступить к созданию видео", callback_data='start_creating_video')],
@@ -293,7 +358,7 @@ class ChatGPTTelegramBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         # Отправка сообщения с кнопками
-        await context.bot.send_message(chat_id=chat_id, text=description_response, reply_markup=reply_markup)
+        await context.bot.send_message(chat_id=chat_id, text=f"А вот и описание для канала! Можешь просто скопировать и вставить его. Кстати, я прикрепила ниже инструкцию, как это сделать 👇\n\n{description_response}", reply_markup=reply_markup)
 
         # await self.prompt(update, context, f"Придумай 50 версий названий для YouTube канала {user_input}. В названии должно содержаться от 2 до 4 слов, отражающих тематику канала, но они должны выглядеть как целостная фраза.На русском языке")
 
@@ -302,7 +367,7 @@ class ChatGPTTelegramBot:
 
     async def view_features(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.message.reply_text(
-            "Добро пожаловать в главное меню! Я помогу тебе с созданием контента на YouTube и оптимизацией видео\n\nВот задачи, с которыми я могу помочь 👇  \n/video - Создать сценарий видео \n/shorts - Создать сценарий shorts  \n/seo - Придумать название и описание к видео  \n/restart - Перезапустить бота \n\nВыбирай нужную функцию в меню ниже"
+            "Добро пожаловать в главное меню! Я помогу тебе с созданием контента на YouTube и оптимизацией видео\n\nВот задачи, с которыми я могу помочь 👇  \n/naming - Упаковка канала \n/video - Создать сценарий видео \n/shorts - Создать сценарий shorts  \n/seo - Придумать название и описание к видео  \n/restart - Перезапуск бота \n\nВыбирай нужную функцию в меню выше"
         )
 
     async def congratulations_with_readiness(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -338,51 +403,49 @@ class ChatGPTTelegramBot:
             # print(self.user_contexts[chat_id], self.user_contexts[chat_id]['_channel_description'])
             if user and user.channel_description:
                 await update.message.reply_text(
-                    "Отлично, я уже знаю, о чем твой канал! Пойду прописывать сценарий, буду меньше, чем через минуту 😇"
+                    "Я вижу, что ты уже загружал описание канала! \n\nУ меня появились мысли о чем можно снять твои первые шортсы! Пойду пропишу сценарий, буду меньше, чем через минуту 😇"
                 )
-                shorts_query = f"Распиши 3 сценариев коротких видео по теме {user.channel_description} :: указав место съемки, раскадровку с числом секунд :: Полный текст, описание ролика с призывом к действию"
+                shorts_query = f"Распиши 3 сценариев коротких видео по теме {user.channel_description} :: указав место съемки, раскадровку с числом секунд :: Полный текст, описание ролика с призывом к действию. Ответ должен быть на Русском языке."
                 shorts_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=shorts_query)
-                await update.message.reply_text(
-                    "Вот твой ответ!"
-                )
-                await update.message.reply_text(
-                    str(shorts_response), parse_mode='Markdown'
+
+                keyboard = [
+                    [InlineKeyboardButton("Создать еще шортсы", callback_data='create_new_shorts')],
+                    [InlineKeyboardButton("Вернуться в меню", callback_data='view_features')]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=str(shorts_response),
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
                 )
                 return
-
-            keyboard = [
-                [InlineKeyboardButton("Хорошо, давай начнём!", callback_data='ready_to_continue')],
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="Я задам всего пару вопросов, а затем ты сможешь перейти к созданию шортсов по команде /shorts 🎥",
-                reply_markup=reply_markup
+            await update.message.reply_text(
+                "Приступим к созданию шортсов! Напиши мне в нескольких предложениях о чем хочешь рассказать людям и я придумаю тебе сценарий 🎥\n\nНачинай свое сообщение с \"О...\""
             )
 
-    async def seo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "Отлично! Давай придумаем описание и название к твоему видео, чтобы оно выдавалось в поисковых запросах. Чтобы я смогла тебе помочь, для начала расскажи мне - о чем твое видео? Буквально в 5 предложениях"
+            self.user_states[update.effective_chat.id] = 'create_new_shorts_handler'
+
+    async def create_new_shorts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.callback_query.message.reply_text(
+            "Приступим к созданию шортсов! Напиши мне в нескольких предложениях о чем хочешь рассказать людям и я придумаю тебе сценарий 🎥\n\nНачинай свое сообщение с \"О...\""
         )
 
-        self.user_states[update.effective_chat.id] = 'waiting_for_seo'
+        self.user_states[update.effective_chat.id] = 'create_new_shorts_handler'
 
-    async def seo_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_input: str):
+    async def create_new_shorts_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_input: str):
         chat_id = update.message.chat_id
         user_id = update.message.from_user.id
 
-        seo_query = f"Создай seo оптимизацию для видео на YouTube по заданию ниже. Придумай 3 названия для видеоролика на YouTube по теме {user_input} Придумай описание к видео на YouTube по теме {user_input} :: Результат представь в следующем виде. Описание должно состоять из 3 абзацев, первый должен отражать содержание и содержать ключевые слова для выдачи в поиске. Количество предложений от 5 до 6. Второй рассказывает про ролик и так же содержит ключевые слова для seo, количество предложений от 7 до 10. В третьем абзаце должно рассказывать о канале, количество предложений от 7 до 10. После этого укажи ссылки на социальные сети. В конце описания должно быть 5 хэштегов по теме видео, каждый хэштег - 1 слово. В Четвертом абзаце укажи 20 тегов от 1 до 3 слов по теме видео. Некоторые теги могут начинать со слова “как”, теги должны идти единым текстовым блоком, через запятую. :: В пятом абзаце придумай 3 идеи концепции для превью картинок на YouTube, какое должно быть фото на фоне, какого цвета фон, какие элементы расположить на картинке и какой должен быть указан текст.."
-        # seo_query = f"Создай seo оптимизацию для видео на YouTube по заданию ниже. Придумай 3 названия для видеоролика на YouTube по теме {user_input}. Придумай описание к видео на YouTube по теме {user_input} :: Результат представь в следующем виде. Описание должно состоять из 3 абзацев, первый должен отражать содержание и содержать ключевые слова для выдачи в поиске. Количество предложений от 5 до 6. Второй рассказывает про ролик и так же содержит ключевые слова для seo, количество предложений от 7 до 10. В третьем абзаце должно рассказывать о канале, количество предложений от 7 до 10. В конце описания должно быть 5 хэштегов по теме видео, каждый хэштег - 1 слово. В Четвертом абзаце укажи 20 тегов от 1 до 3 слов по теме видео. Некоторые теги могут начинать со слова “как”, теги должны идти единым текстовым блоком, через запятую. :: В пятом абзаце придумай 3 идеи концепции для превью картинок на YouTube, какое должно быть фото на фоне, какого цвета фон, какие элементы расположить на картинке и какой должен быть указан текст. В шестом абзаце напиши, укажи ссылки на соцсети"
-
-        shorts_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=seo_query)
+        shorts_query = f"Распиши 3 сценариев коротких видео по теме {user_input} :: указав место съемки, раскадровку с числом секунд :: Полный текст, описание ролика с призывом к действию. Ответ должен быть на Русском языке."
+        shorts_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=shorts_query)
         await update.message.reply_text(
             "Вот твой ответ!"
         )
-
         keyboard = [
-            [InlineKeyboardButton("Посмотреть функции", callback_data='view_features')],
+            [InlineKeyboardButton("Создать еще shorts", callback_data='create_new_shorts')],
+            [InlineKeyboardButton("Вернуться в меню", callback_data='view_features')]
         ]
-
         reply_markup = InlineKeyboardMarkup(keyboard)
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -390,6 +453,82 @@ class ChatGPTTelegramBot:
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
+
+    async def seo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # await update.message.reply_text(
+        #     "Отлично! Давай придумаем описание и название к твоему видео, чтобы оно выдавалось в поисковых запросах. Чтобы я смогла тебе помочь, для начала расскажи мне - о чем твое видео? Буквально в 5 предложениях"
+        # )
+        await update.message.reply_text(
+            "Отлично! Теперь пришли мне ссылку на видео, например, может загрузить его в доступ по ссылке на YouTube и отправить ее мне"
+        )
+
+        self.user_states[update.effective_chat.id] = 'waiting_for_seo'
+
+    def get_subtitles(self, url):
+        # Регулярные выражения для извлечения идентификатора видео из различных форматов URL YouTube
+        regex_patterns = [
+            r"(?:http[s]?://)?(?:www\.)?youtu\.be\/([a-zA-Z0-9_-]+)",  # Сокращённый URL
+            r"(?:http[s]?://)?(?:www\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]+)",  # Стандартный URL с параметром v
+            r"(?:http[s]?://)?(?:www\.)?youtube\.com/v/([a-zA-Z0-9_-]+)",  # URL с /v/
+            r"(?:http[s]?://)?(?:www\.)?youtube\.com/embed/([a-zA-Z0-9_-]+)",  # URL встроенного видео
+        ]
+
+        video_id = None
+        for pattern in regex_patterns:
+            match = re.search(pattern, url)
+            if match:
+                video_id = match.group(1)
+                break
+
+        if video_id is None:
+            raise ValueError("Некорректный URL. Пожалуйста, введи правильную ссылку на видео YouTube.")
+
+        try:
+            subtitles = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'en'])
+            subtitles_text = " ".join(item['text'] for item in subtitles)
+            return subtitles_text
+        except NoTranscriptFound:
+            raise ValueError("Для данного видео не найдены субтитры.")
+        except TranslationLanguageNotAvailable:
+            raise ValueError("Для данного видео нет субтитров на русском или английском языке.")
+        except TranscriptsDisabled:
+            raise ValueError("Субтитры для данного видео отключены, либо ссылка недействительная.")
+        except Exception as e:
+            raise ValueError(f"Ошибка при получении субтитров: {e}")
+
+    async def seo_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_input: str):
+        chat_id = update.message.chat_id
+        user_id = update.message.from_user.id
+
+        try:
+            subtitles = self.get_subtitles(user_input)
+            await update.message.reply_text(
+                "Отлично! Ушла писать сценарии! 😇"
+            )
+            print(subtitles)
+            # TODO: обработка битой ссылки
+            seo_query = f"Текст популярного видео: {subtitles[:25000]}. на основании представленного выше текста из видео сделай следующие шаги :: Создай seo оптимизацию для видео на YouTube по заданию ниже: Придумай название для видеоролика на YouTube. Количество слов в названии от 3 до 10. Предложи мне 5 идей :: Придумай описание к видео на ютюбу :: Описание должно состоять из 3 абзацев, первый должен отражать содержание и содержать ключевые слова для выдачи в поиске. Количество предложений от 10 до 15. Второй рассказывает про ролик и так же содержит ключевые слова для seo, количество предложений от 12 до 15. В третьем абзаце должно рассказывать о канале, количество предложений от 14 до 18. В конце описания должно быть 5 хэштегов по теме видео, каждый хэштег - 1 слово. В. Четвертом абзаце к описанию укажи ссылки на мои социальные сети Инстаграм - Телеграмм - :: Придумай 20 тегов к видео на YouTube и перечисли их через запятую :: Фразы могут содержать от 1 до 3 слов. Некоторые теги могут начинать со слова “как”, представь теги единым списком разделив их запятой. :: Также придумай на основе информации выше 10 идей концепции для превью картинок на видео на YouTube, какое должно быть фото на фоне, какого цвета фон, какие элементы расположить на картинке и какой должен быть указан текст. Ответ должен быть на русском языке и, если надо, то с использованием Markdown: вместо ### оборачивай ту часть сообщения, которую хочешь сделать жирным шрифтом, в ** перед началом предложения и ** в конце"
+
+            seo_response, seo_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=seo_query)
+            await update.message.reply_text(
+                "Вот твой ответ!"
+            )
+
+            keyboard = [
+                [InlineKeyboardButton("Посмотреть функции", callback_data='view_features')],
+            ]
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=str(seo_response),
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+        except ValueError as e:
+            print(e)
+            await context.bot.send_message(chat_id=chat_id, text=str(e))
+            self.user_states[update.message.from_user.id] = "awaiting_correct_url"
 
     async def video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.message.chat_id
@@ -406,27 +545,59 @@ class ChatGPTTelegramBot:
             # TODO: добавить поддержку ответа (response) в несколько сообщений (когда ответы большие)
             if user and user.channel_description:
                 await update.message.reply_text(
-                    "Отлично, я уже знаю, о чем можно снять первое видео! Пойду прописывать сценарий, буду меньше, чем через минуту 😇"
+                    "Я вижу, что ты уже загружал описание канала!\n\nУ меня появились мысли о чем можно снять твое первое видео! Пойду пропишу сценарий, буду меньше, чем через минуту 😇"
                 )
-                video_query = f"Распиши сценарий видео на 5-10 минут по теме {user.channel_description} :: указав место съемки, подробную раскадровку с числом секунд, внешний вид автора :: Напиши полный текст, по каждому промежутку раскадровки, который произнесет автор, с завершением ролика призывом к действию :: А после укажи рекомендации, на что обратить внимание при съемке"
+                video_query = f"Распиши сценарий видео на 5-10 минут по теме {user.channel_description} :: указав место съемки, подробную раскадровку с числом секунд, внешний вид автора :: Напиши полный текст, по каждому промежутку раскадровки, который произнесет автор, с завершением ролика призывом к действию :: А после укажи рекомендации, на что обратить внимание при съемке. Ответ должен быть на Русском языке."
                 video_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=video_query)
-                await update.message.reply_text(
-                    "Вот твой ответ!"
-                )
-                await update.message.reply_text(
-                    str(video_response), parse_mode='Markdown'
+
+                keyboard = [
+                    [InlineKeyboardButton("Создать еще видео", callback_data='create_new_video')],
+                    [InlineKeyboardButton("Вернуться в меню", callback_data='view_features')]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=str(video_response),
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
                 )
                 return
 
-            keyboard = [
-                [InlineKeyboardButton("Хорошо, давай начнём!", callback_data='ready_to_continue')],
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="Я задам всего пару вопросов, а затем ты сможешь перейти к созданию видео по команде /video 🎥",
-                reply_markup=reply_markup
+            await update.message.reply_text(
+                "Приступим к созданию видео! Напиши мне в нескольких предложениях о чем хочешь создать ролик и я придумаю тебе сценарий 🎥\n\nНачинай свое сообщение с \"О...\""
             )
+
+            self.user_states[update.effective_chat.id] = 'create_new_video_handler'
+
+    # TODO: поощрать пользователей
+    async def create_new_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.callback_query.message.reply_text(
+            "Приступим к созданию видео! Напиши мне в нескольких предложениях о чем хочешь создать ролик и я придумаю тебе сценарий 🎥\n\nНачинай свое сообщение с \"О...\""
+        )
+
+        self.user_states[update.effective_chat.id] = 'create_new_video_handler'
+
+    async def create_new_video_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_input: str):
+        chat_id = update.message.chat_id
+        user_id = update.message.from_user.id
+
+        video_query = f"Распиши сценарий видео на 5-10 минут по теме {user_input} :: указав место съемки, подробную раскадровку с числом секунд, внешний вид автора :: Напиши полный текст, по каждому промежутку раскадровки, который произнесет автор, с завершением ролика призывом к действию :: А после укажи рекомендации, на что обратить внимание при съемке. Ответ должен быть на Русском языке."
+        video_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=video_query)
+        await update.message.reply_text(
+            "Вот твой ответ!"
+        )
+        keyboard = [
+            [InlineKeyboardButton("Создать еще видео", callback_data='create_new_video')],
+            [InlineKeyboardButton("Вернуться в меню", callback_data='view_features')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=str(video_response),
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
 
     async def restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.message.chat_id
@@ -1443,6 +1614,7 @@ class ChatGPTTelegramBot:
             .build()
 
         application.add_handler(CommandHandler('start', self.start))
+        application.add_handler(CommandHandler('naming', self.restart))
         application.add_handler(CommandHandler('shorts', self.shorts))
         application.add_handler(CommandHandler('seo', self.seo))
         application.add_handler(CommandHandler('video', self.video))
