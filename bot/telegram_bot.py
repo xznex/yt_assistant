@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import io
 import logging
 import os
 import re
+from functools import wraps
 from uuid import uuid4
 
 from PIL import Image
@@ -24,12 +26,61 @@ from utils import is_group_chat, get_thread_id, message_text, wrap_with_indicato
     cleanup_intermediate_files
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled, \
     TranslationLanguageNotAvailable
+import prodamuspy
 
 from database import Session
-from models import User
+from models import User, Subscription
+
+"""
+    TODO: добавить кнопки (меню, личный кабинет, информация о проекте, связаться с поддержкой, реферальная система)
+
+    В личном кабинете должна быть инфа о текущем тарифе
+
+    личный кабинет:
+        Добро пожаловать, *Имя*
+        
+        Ваш текущий тариф: демо
+        Дата окончания:  —
+        
+        (Или же та, которая в кабинете) 
+        
+        Чтобы пользоваться ботом без ограничений, необходимо  оформить подписку 👇🏻
+        
+        Узнать о тарифных планах (кнопка вызывает окошко - информация о проекте)
+        
+        Наши другие сервисы (здесь ссылка на сайт fabricbot.ru)
+    информация о проекте:
+        Информация о проекте👇🏻
+
+        Привет, я твой карманный YouTube продюсер 👋🏻  
+        
+        Создатель назвал меня Сильвия, но для тебя я буду ассистентом по старту твоего канала на YouTube 🎥  
+        
+        Я существую, чтобы ты сэкономил сотни тысяч рублей на найме команды или на дорогом продакшне и начал получать первые просмотры уже сегодня вечером❤️  
+        
+        Я придумаю за тебя сценарии и даже пропишу теги к видео, тебе останется лишь снять и выложить ролик 😻
+        
+        По умолчанию ты можешь воспользоваться любыми функциями 2 раза без оплаты 
+        
+        Чтобы пользоваться ботом без ограничений, необходимо оформить подписку 
+        
+        Выбери желаемый тариф и в течение 5-10 минут после оплаты я пришлю тебе сообщение👇🏻
+        
+        Тарифы в виде кнопок
+        
+        1 день - 290 рублей 
+        7 дней - 1490 рублей
+        30 дней - 4990 рублей
+    реферальная система:
+        За каждого приглашенного пользователя, который оплатил любую подписку, я буду дарить тебе 20% от ее стоимости, воспользоваться ты ей можешь, оплатив любой тариф при достаточно балансе
+
+        Для этого человек должен быть авторизован по вашей реферальной ссылке: *реф ссылка персонализированная* - она выдается через телеграмм апи 
+        
+        Для активации нужно связаться с поддержкой: @fabricbothelper
+    
+"""
 
 
-# aboba
 class UserContext:
     """
     Class user context
@@ -112,11 +163,17 @@ class ChatGPTTelegramBot:
         self.config = config
         self.openai = openai
         bot_language = self.config['bot_language']
+        # меню, личный кабинет, информация о проекте, связаться с поддержкой, реферальная система
         self.commands = [
+            BotCommand(command='info', description="Информация о проекте"),
+            BotCommand(command='menu', description="Меню"),
+            BotCommand(command='account', description="Личный кабинет"),
             BotCommand(command='naming', description="Упаковка канала"),
             BotCommand(command='video', description="Создать сценарий видео"),
             BotCommand(command='shorts', description="Создать сценарий shorts"),
             BotCommand(command='seo', description="Придумать название и описание к видео"),
+            BotCommand(command='referral', description="Реферальная система"),
+            BotCommand(command='support', description="Связаться с поддержкой"),
             BotCommand(command='restart', description="Перезапуск бота"),
         ]
         # If imaging is enabled, add the "image" command to the list
@@ -140,6 +197,55 @@ class ChatGPTTelegramBot:
         self.user_states = {}
         self.user_input = {}
 
+    async def check_subscription_status(self, user_id: int, feature: str) -> bool:
+        # Проверяем наличие свободных попыток
+        with Session() as session:
+            user = session.query(User).filter(User.id == user_id).first()
+            if not user:
+                return False
+
+            # Получаем количество свободных попыток для конкретной функции
+            free_uses_attr = f"{feature}_free_uses"
+            free_uses = getattr(user, free_uses_attr, 0)
+
+            if free_uses > 0:
+                # Уменьшаем количество свободных попыток и возвращаем True
+                setattr(user, free_uses_attr, free_uses - 1)
+                session.commit()
+                return True
+
+            current_time = datetime.now()
+            subscription = session.query(Subscription) \
+                .filter(Subscription.user_id == user_id, Subscription.expiration_date > current_time) \
+                .first()
+            if subscription:
+                # Подписка действует
+                return True
+
+        # Нет действующей подписки и свободных попыток
+        return False
+
+    async def check_and_handle_subscription_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE, feature: str):
+        user_id = update.effective_user.id
+        has_subscription = await self.check_subscription_status(user_id, feature)
+
+        if not has_subscription:
+            keyboard = [
+                [InlineKeyboardButton("1 день - 290 рублей", callback_data='subscription_1_day')],
+                [InlineKeyboardButton("7 дней - 1490 рублей", callback_data='subscription_7_days')],
+                [InlineKeyboardButton("30 дней - 4990 рублей", callback_data='subscription_30_days')],
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="У вас нет активной подписки или свободных попыток.\n\n"
+                     "Чтобы пользоваться ботом без ограничений, необходимо оформить подписку\n\n"
+                     "Выбери желаемый тариф и в течение 5-10 минут после оплаты я пришлю тебе сообщение👇🏻",
+                reply_markup=reply_markup
+            )
+            return False
+        return True
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.message.chat_id
 
@@ -154,7 +260,6 @@ class ChatGPTTelegramBot:
             "Но для начала давай познакомимся, как тебя зовут?"
         )
 
-        # self.user_context.chat_id = chat_id
         self.user_states[update.effective_chat.id] = 'waiting_for_name'
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,9 +308,6 @@ class ChatGPTTelegramBot:
             await self.seo_handler(update, context, user_input)
         elif state == 'create_new_video_handler':
             user_input = update.message.text
-            await update.message.reply_text(
-                "Отлично! Ушла писать сценарий! 😇"
-            )
             await self.create_new_video_handler(update, context, user_input)
         elif state == 'create_new_shorts_handler':
             user_input = update.message.text
@@ -224,12 +326,9 @@ class ChatGPTTelegramBot:
                 await context.bot.send_message(chat_id=update.message.chat_id,
                                                text="Некорректный URL. Пожалуйста, введи правильную ссылку на видео YouTube.")
 
-    # Да, все callback-запросы, созданные в вашем боте, будут перенаправляться в handle_callback_query.
-    # Ваша задача — в этой функции различать идентификаторы (callback data) этих запросов и реагировать на них
-    # соответствующим образом. Вы можете использовать уникальные идентификаторы для разных кнопок и проверять их
-    # в handle_callback_query, чтобы определить, какую логику следует выполнить в ответ на действие пользователя.
-    # Это стандартный подход для работы с callback-запросами в Telegram ботах.
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # user_id = update.message.from_user.id
+        chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat_id
         query = update.callback_query
         await query.answer()
         if query.data == 'channel_exists':
@@ -239,8 +338,6 @@ class ChatGPTTelegramBot:
         elif query.data == "ready_to_continue":
             await self.input_channel_packaging(update, context)
         elif query.data == "turnkey_channel":
-            # await self.to_continue_or_see_features(update, context)
-            # await self.left_to_develop(update, context)
             await update.callback_query.message.reply_text(
                 "Отлично, уже ушла разрабатывать концепцию для названия твоего канала, а пока ты можешь еще кое с чем мне помочь. \n\nНапиши от 10 до 40 слов, которыми можно описать идею твоего канала, это сильно поможет нам выводить наши ролик в топы запросов зрителей в будущем 😍"
             )
@@ -253,12 +350,31 @@ class ChatGPTTelegramBot:
             await self.create_new_video(update, context)
         elif query.data == "create_new_shorts":
             await self.create_new_shorts(update, context)
+        elif query.data == "info":
+            await self.info(update, context)
+        elif query.data == 'subscription_1_day':
+            # payment_url = "https://kirbudilovcoach.payform.ru/?do=pay&products"
+            # link = "https://kirbudilovcoach.payform.ru/?order_id=test&products[0][price]=2000&products[0][quantity]=1&products[0][name]=Обучающие материалы&customer_extra=Полная оплата курса&do=pay"
+            # prodamus = prodamuspy.PyProdamus(os.environ['PRODAMUS_TOKEN'])
+            # bodyDict = prodamus.parse(body)
+            # checkSign = prodamus.sign(bodyDict)
+            payment_url = "https://kirbudilovcoach.payform.ru/subscription_1_day"
+        elif query.data == 'subscription_7_days':
+            payment_url = "https://kirbudilovcoach.payform.ru/?do=pay&products"
+            current_datetime = datetime.now().strftime("%Y%m%d%H%M%S")
+            order_id = f"{user_id}_{current_datetime}"
+            link = "https://kirbudilovcoach.payform.ru/?order_id=test&products[0][price]=1490&products[0][quantity]=1&subscription=1779399&do=pay"
+            payment_url = "https://kirbudilovcoach.payform.ru/subscription_7_days"
+        elif query.data == 'subscription_30_days':
+
+            payment_url = "https://kirbudilovcoach.payform.ru/subscription_30_days"
+
+    async def menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "Добро пожаловать в главное меню! Я помогу тебе с созданием контента на YouTube и оптимизацией видео\n\nВот задачи, с которыми я могу помочь 👇  \n/naming - Упаковка канала \n/video - Создать сценарий видео \n/shorts - Создать сценарий shorts  \n/seo - Придумать название и описание к видео  \n/restart - Перезапуск бота \n\nВыбирай нужную функцию в меню выше"
+        )
 
     async def couple_of_questions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Ваша логика для обработки ситуации, когда у пользователя уже есть канал
-        # await update.message.reply_text(
-        #
-        # )
         keyboard = [
             [InlineKeyboardButton("Да", callback_data='ready_to_continue')],
         ]
@@ -279,7 +395,6 @@ class ChatGPTTelegramBot:
         self.user_states[update.effective_chat.id] = 'awaiting_channel_description'
 
     async def to_continue_or_see_features(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_input: str):
-        # Просто выводим обратно текст, полученный от пользователя
         # Сохраняем описание
         user_id = update.message.from_user.id
         chat_id = update.effective_chat.id
@@ -321,6 +436,10 @@ class ChatGPTTelegramBot:
 
         user_description = user_description
 
+        feature = "naming"
+        if not await self.check_and_handle_subscription_status(update, context, feature):
+            return
+
         await update.message.reply_text(
             "Отлично, через 30 секунд вернусь к тебе с идеями с названием и с описанием канала, никуда не уходи!"
         )
@@ -337,7 +456,8 @@ class ChatGPTTelegramBot:
         titles_prompt = f"Придумай 50 версий названий для YouTube канала {user_input}. В названии должно содержаться от 2 до 4 слов, отражающих тематику канала, но они должны выглядеть как целостная фраза. Пожалуйста, кроме 50 названий ничего больше не пиши в этом ответе. На русском языке"
         description_prompt = f"Напиши описание к ютуб каналу про {user_description} В описании должно быть 400 слов. Укажи подробности о том, какой контент здесь люди смогут посмотреть и добавь призывы на подписку на канал и укажи, кому точно стоит оставаться на канале и смотреть его регулярно, чтобы не пропустить новых видео. Ответ должен быть на Русском языке."
         titles_response, titles_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=titles_prompt)
-        description_response, description_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=description_prompt)
+        description_response, description_total_tokens = await self.openai.get_chat_response(chat_id=chat_id,
+                                                                                             query=description_prompt)
         # await update.message.reply_text(
         #     f"Придумала для тебя 50 идей для названия, выбери любое понравившееся 👇\n\n{user_input}"
         # )
@@ -358,7 +478,9 @@ class ChatGPTTelegramBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         # Отправка сообщения с кнопками
-        await context.bot.send_message(chat_id=chat_id, text=f"А вот и описание для канала! Можешь просто скопировать и вставить его. Кстати, я прикрепила ниже инструкцию, как это сделать 👇\n\n{description_response}", reply_markup=reply_markup)
+        await context.bot.send_message(chat_id=chat_id,
+                                       text=f"А вот и описание для канала! Можешь просто скопировать и вставить его. Кстати, я прикрепила ниже инструкцию, как это сделать 👇\n\n{description_response}",
+                                       reply_markup=reply_markup)
 
         # await self.prompt(update, context, f"Придумай 50 версий названий для YouTube канала {user_input}. В названии должно содержаться от 2 до 4 слов, отражающих тематику канала, но они должны выглядеть как целостная фраза.На русском языке")
 
@@ -376,26 +498,31 @@ class ChatGPTTelegramBot:
         reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("Меню", callback_data='view_features')]])
         await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode='Markdown')
 
-    # async def left_to_develop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #     chat_id = update.message.chat_id
-    #
-    #     await update.message.reply_text(
-    #         "Отлично, уже ушла разрабатывать концепцию для названия твоего канала, а пока ты можешь еще кое с чем мне помочь. Напиши от 10 до 40 слов, которыми можно описать идею твоего канала, это сильно поможет нам выводить наши ролик в топы запросов зрителей в будущем 😍"
-    #     )
-    #     await update.message.reply_text(
-    #         "Напиши слова списком, сколько сможешь придумать. Пример: Психология, коучинг, мышление, состояние, тело, здоровье, ..."
-    #     )
-    #
-    #     self.user_context.chat_id = chat_id
-    #     self.user_states[update.effective_chat.id] = 'waiting_for_name'
+    async def naming(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.message.from_user.id
+        with Session() as session:
+            user = session.query(User).filter(User.id == user_id).first()
+            if user:
+                user.channel_description = None
+                user.channel_idea = None
+                session.commit()
+
+        await update.message.reply_text(
+            "Класс, начнем упаковывать канал. Расскажи мне в 2-3х предложениях о чем твой он?\n\nПостарайся раскрыться максимально подробно, это правда важно ❤️"
+        )
+        await update.message.reply_text(
+            "Напиши мне сообщения, начиная с \"О...\"\n\nНапример: О том, как помогать людям избавляться от тревожности с помощью трансовые техник и как стать более счастливым и ментально здоровым человеком. Мой канал про психологию, мышление и психическое здоровье. Про..."
+        )
+
+        self.user_states[update.effective_chat.id] = 'awaiting_channel_description'
 
     async def shorts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.message.chat_id
         user_id = update.message.from_user.id
 
-        await update.message.reply_text(
-            "Приступим к созданию shorts!"
-        )
+        # await update.message.reply_text(
+        #     "Приступим к созданию shorts!"
+        # )
 
         # TODO: для всех обращений к локальному хранилищу, проверять БД + оптимизировать
         with Session() as session:
@@ -405,8 +532,12 @@ class ChatGPTTelegramBot:
                 await update.message.reply_text(
                     "Я вижу, что ты уже загружал описание канала! \n\nУ меня появились мысли о чем можно снять твои первые шортсы! Пойду пропишу сценарий, буду меньше, чем через минуту 😇"
                 )
+                feature = "shorts"
+                if not await self.check_and_handle_subscription_status(update, context, feature):
+                    return
                 shorts_query = f"Распиши 3 сценариев коротких видео по теме {user.channel_description} :: указав место съемки, раскадровку с числом секунд :: Полный текст, описание ролика с призывом к действию. Ответ должен быть на Русском языке."
-                shorts_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=shorts_query)
+                shorts_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id,
+                                                                                           query=shorts_query)
 
                 keyboard = [
                     [InlineKeyboardButton("Создать еще шортсы", callback_data='create_new_shorts')],
@@ -427,6 +558,8 @@ class ChatGPTTelegramBot:
             self.user_states[update.effective_chat.id] = 'create_new_shorts_handler'
 
     async def create_new_shorts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        print("ff")  # даже не вызывается
+        print(update, update.message)
         await update.callback_query.message.reply_text(
             "Приступим к созданию шортсов! Напиши мне в нескольких предложениях о чем хочешь рассказать людям и я придумаю тебе сценарий 🎥\n\nНачинай свое сообщение с \"О...\""
         )
@@ -434,14 +567,13 @@ class ChatGPTTelegramBot:
         self.user_states[update.effective_chat.id] = 'create_new_shorts_handler'
 
     async def create_new_shorts_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_input: str):
-        chat_id = update.message.chat_id
-        user_id = update.message.from_user.id
+        chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat_id
 
+        feature = "shorts"
+        if not await self.check_and_handle_subscription_status(update, context, feature):
+            return
         shorts_query = f"Распиши 3 сценариев коротких видео по теме {user_input} :: указав место съемки, раскадровку с числом секунд :: Полный текст, описание ролика с призывом к действию. Ответ должен быть на Русском языке."
         shorts_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=shorts_query)
-        await update.message.reply_text(
-            "Вот твой ответ!"
-        )
         keyboard = [
             [InlineKeyboardButton("Создать еще shorts", callback_data='create_new_shorts')],
             [InlineKeyboardButton("Вернуться в меню", callback_data='view_features')]
@@ -455,16 +587,13 @@ class ChatGPTTelegramBot:
         )
 
     async def seo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # await update.message.reply_text(
-        #     "Отлично! Давай придумаем описание и название к твоему видео, чтобы оно выдавалось в поисковых запросах. Чтобы я смогла тебе помочь, для начала расскажи мне - о чем твое видео? Буквально в 5 предложениях"
-        # )
         await update.message.reply_text(
             "Отлично! Теперь пришли мне ссылку на видео, например, может загрузить его в доступ по ссылке на YouTube и отправить ее мне"
         )
 
         self.user_states[update.effective_chat.id] = 'waiting_for_seo'
 
-    def get_subtitles(self, url):
+    async def get_subtitles(self, url):
         # Регулярные выражения для извлечения идентификатора видео из различных форматов URL YouTube
         regex_patterns = [
             r"(?:http[s]?://)?(?:www\.)?youtu\.be\/([a-zA-Z0-9_-]+)",  # Сокращённый URL
@@ -501,30 +630,50 @@ class ChatGPTTelegramBot:
         user_id = update.message.from_user.id
 
         try:
-            subtitles = self.get_subtitles(user_input)
+            feature = "seo"
+            if not await self.check_and_handle_subscription_status(update, context, feature):
+                return
             await update.message.reply_text(
-                "Отлично! Ушла писать сценарии! 😇"
+                "Отлично! Ушла разрабатывать seo! 😇"
             )
+            subtitles = await self.get_subtitles(user_input)
             print(subtitles)
             # TODO: обработка битой ссылки
             seo_query = f"Текст популярного видео: {subtitles[:25000]}. на основании представленного выше текста из видео сделай следующие шаги :: Создай seo оптимизацию для видео на YouTube по заданию ниже: Придумай название для видеоролика на YouTube. Количество слов в названии от 3 до 10. Предложи мне 5 идей :: Придумай описание к видео на ютюбу :: Описание должно состоять из 3 абзацев, первый должен отражать содержание и содержать ключевые слова для выдачи в поиске. Количество предложений от 10 до 15. Второй рассказывает про ролик и так же содержит ключевые слова для seo, количество предложений от 12 до 15. В третьем абзаце должно рассказывать о канале, количество предложений от 14 до 18. В конце описания должно быть 5 хэштегов по теме видео, каждый хэштег - 1 слово. В. Четвертом абзаце к описанию укажи ссылки на мои социальные сети Инстаграм - Телеграмм - :: Придумай 20 тегов к видео на YouTube и перечисли их через запятую :: Фразы могут содержать от 1 до 3 слов. Некоторые теги могут начинать со слова “как”, представь теги единым списком разделив их запятой. :: Также придумай на основе информации выше 10 идей концепции для превью картинок на видео на YouTube, какое должно быть фото на фоне, какого цвета фон, какие элементы расположить на картинке и какой должен быть указан текст. Ответ должен быть на русском языке и, если надо, то с использованием Markdown: вместо ### оборачивай ту часть сообщения, которую хочешь сделать жирным шрифтом, в ** перед началом предложения и ** в конце"
 
             seo_response, seo_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=seo_query)
-            await update.message.reply_text(
-                "Вот твой ответ!"
-            )
 
             keyboard = [
                 [InlineKeyboardButton("Посмотреть функции", callback_data='view_features')],
             ]
 
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=str(seo_response),
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=str(seo_response),
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                # Если возникла ошибка, проверяем её тип
+                if "can't parse entities" in str(e):
+                    # Если ошибка связана с невозможностью разбора сущностей, повторяем без Markdown
+                    try:
+                        await context.bot.send_message(
+                            chat_id=update.effective_chat.id,
+                            text=str(seo_response),
+                            reply_markup=reply_markup,
+                            # Здесь не указываем parse_mode, чтобы отправить сообщение без форматирования
+                        )
+                    except Exception as e:
+                        # Обработка других потенциальных ошибок при повторной попытке
+                        print("Ошибка при отправке сообщения без Markdown: ", str(e))
+                        await context.bot.send_message(chat_id=chat_id, text=str(e))
+                else:
+                    # Логирование или обработка других типов ошибок
+                    print("Ошибка при отправке сообщения: ", str(e))
+                    await context.bot.send_message(chat_id=chat_id, text=str(e))
         except ValueError as e:
             print(e)
             await context.bot.send_message(chat_id=chat_id, text=str(e))
@@ -544,11 +693,15 @@ class ChatGPTTelegramBot:
             # TODO: добавить возможность создавать новые видео
             # TODO: добавить поддержку ответа (response) в несколько сообщений (когда ответы большие)
             if user and user.channel_description:
+                feature = "video"
+                if not await self.check_and_handle_subscription_status(update, context, feature):
+                    return
                 await update.message.reply_text(
                     "Я вижу, что ты уже загружал описание канала!\n\nУ меня появились мысли о чем можно снять твое первое видео! Пойду пропишу сценарий, буду меньше, чем через минуту 😇"
                 )
                 video_query = f"Распиши сценарий видео на 5-10 минут по теме {user.channel_description} :: указав место съемки, подробную раскадровку с числом секунд, внешний вид автора :: Напиши полный текст, по каждому промежутку раскадровки, который произнесет автор, с завершением ролика призывом к действию :: А после укажи рекомендации, на что обратить внимание при съемке. Ответ должен быть на Русском языке."
-                video_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=video_query)
+                video_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id,
+                                                                                          query=video_query)
 
                 keyboard = [
                     [InlineKeyboardButton("Создать еще видео", callback_data='create_new_video')],
@@ -581,6 +734,12 @@ class ChatGPTTelegramBot:
         chat_id = update.message.chat_id
         user_id = update.message.from_user.id
 
+        feature = "video"
+        if not await self.check_and_handle_subscription_status(update, context, feature):
+            return
+        await update.message.reply_text(
+            "Отлично! Ушла писать сценарий! 😇"
+        )
         video_query = f"Распиши сценарий видео на 5-10 минут по теме {user_input} :: указав место съемки, подробную раскадровку с числом секунд, внешний вид автора :: Напиши полный текст, по каждому промежутку раскадровки, который произнесет автор, с завершением ролика призывом к действию :: А после укажи рекомендации, на что обратить внимание при съемке. Ответ должен быть на Русском языке."
         video_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=video_query)
         await update.message.reply_text(
@@ -598,8 +757,19 @@ class ChatGPTTelegramBot:
             parse_mode='Markdown'
         )
 
+    async def support(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        keyboard = [
+            [InlineKeyboardButton("Написать", url='https://t.me/fabricbothelper')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Для того, чтобы связаться с поддержкой, нажмите по кнопке ниже 🎥",
+            reply_markup=reply_markup
+        )
 
     async def restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        print("дошла")
         chat_id = update.message.chat_id
         user_id = update.message.from_user.id
         with Session() as session:
@@ -611,6 +781,81 @@ class ChatGPTTelegramBot:
                 session.commit()
         await self.start(update, context)
 
+    async def info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        keyboard = [
+            [InlineKeyboardButton("1 день - 290 рублей", callback_data='subscription_1_day')],
+            [InlineKeyboardButton("7 дней - 1490 рублей", callback_data='subscription_7_days')],
+            [InlineKeyboardButton("30 дней - 4990 рублей", callback_data='subscription_30_days')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Информация о проекте👇🏻\n\n"
+                 f"Привет, я твой карманный YouTube продюсер 👋🏻  \n\n"
+                 f"Создатель назвал меня Сильвия, но для тебя я буду ассистентом по старту твоего канала на YouTube 🎥 \n\n"
+                 f"Я существую, чтобы ты сэкономил сотни тысяч рублей на найме команды или на дорогом продакшне и начал получать первые просмотры уже сегодня вечером❤\n\n"
+                 f"Я придумаю за тебя сценарии и даже пропишу теги к видео, тебе останется лишь снять и выложить ролик 😻\n\n"
+                 f"По умолчанию ты можешь воспользоваться любыми функциями 2 раза без оплаты\n\n"
+                 f"Чтобы пользоваться ботом без ограничений, необходимо оформить подписку\n\n"
+                 f"Выбери желаемый тариф и в течение 5-10 минут после оплаты я пришлю тебе сообщение👇🏻\n\n",
+            reply_markup=reply_markup
+        )
+
+    async def account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Добро пожаловать, *Имя*
+
+        Ваш текущий тариф: демо
+        Дата окончания:  —
+
+        (Или же та, которая в кабинете)
+
+        Чтобы пользоваться ботом без ограничений, необходимо  оформить подписку 👇🏻
+
+        Узнать о тарифных планах (кнопка вызывает окошко - информация о проекте)
+
+        Наши другие сервисы (здесь ссылка на сайт fabricbot.ru)
+        """
+        user_id = update.message.from_user.id
+        name = "Аноним"
+        tariff_info = "демо"
+        expiration_date = "—"
+        with Session() as session:
+            user = session.query(User).filter(User.id == user_id).first()
+            if user:
+                name = user.name or name
+                subscription = session.query(Subscription).filter(Subscription.user_id == user_id).first()
+                if subscription:
+                    # Предполагается, что статус подписки хранится в поле status
+                    tariff_info = subscription.status
+                    # Дата окончания подписки в формате YYYY-MM-DD
+                    expiration_date = subscription.expiration_date.strftime("%Y-%m-%d")
+            keyboard = [
+                [InlineKeyboardButton("Узнать о тарифных планах", callback_data='info')],
+                [InlineKeyboardButton("Наши другие сервисы", url="https://fabricbot.ru")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"Добро пожаловать, {name}!\n\n"
+                     f"Ваш текущий тариф: {tariff_info}\n"
+                     f"Дата окончания:  {expiration_date}\n\n"
+                     f"Чтобы пользоваться ботом без ограничений, необходимо оформить подписку 👇🏻",
+                reply_markup=reply_markup
+            )
+
+    async def referral(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        keyboard = [
+            [InlineKeyboardButton("Связаться с поддержкой", url='https://t.me/fabricbothelper')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"За каждого приглашенного пользователя, который оплатил любую подписку, я буду дарить тебе 20% от ее стоимости, воспользоваться ты ей можешь, оплатив любой тариф при достаточно балансе\n\n"
+                 f"Для этого человек должен быть авторизован по вашей реферальной ссылке: *реф ссылка персонализированная* - она выдается через телеграм апи\n\n"
+                 f"Для активации нужно связаться с поддержкой",
+            reply_markup=reply_markup
+        )
 
     async def help(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         """
@@ -1613,12 +1858,26 @@ class ChatGPTTelegramBot:
             .concurrent_updates(True) \
             .build()
 
+        """
+            BotCommand(command='info', description="Информация о проекте"),
+            BotCommand(command='menu', description="Меню"),
+            BotCommand(command='account', description="Личный кабинет"),
+            BotCommand(command='referral', description="Реферальная система"),
+            BotCommand(command='support', description="Связаться с поддержкой"),
+        """
+
         application.add_handler(CommandHandler('start', self.start))
-        application.add_handler(CommandHandler('naming', self.restart))
+        application.add_handler(CommandHandler('naming', self.naming))
         application.add_handler(CommandHandler('shorts', self.shorts))
         application.add_handler(CommandHandler('seo', self.seo))
         application.add_handler(CommandHandler('video', self.video))
         application.add_handler(CommandHandler('restart', self.restart))
+
+        application.add_handler(CommandHandler('info', self.info))
+        application.add_handler(CommandHandler('menu', self.menu))
+        application.add_handler(CommandHandler('account', self.account))
+        application.add_handler(CommandHandler('referral', self.referral))
+        application.add_handler(CommandHandler('support', self.support))
 
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.handle_message))
         application.add_handler(CallbackQueryHandler(self.handle_callback_query))
