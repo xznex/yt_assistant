@@ -230,10 +230,15 @@ class ChatGPTTelegramBot:
         has_subscription = await self.check_subscription_status(user_id, feature)
 
         if not has_subscription:
+            subscription_7_id = 1779399
+            subscription_30_id = 1779400
+            url_7_success = f"https://t.me/youtube_assistant_dev2_bot?start=subscription_paid_7_days_{user_id}"
+            url_30_success = f"https://t.me/youtube_assistant_dev2_bot?start=subscription_paid_30_days_{user_id}"
+
             keyboard = [
-                [InlineKeyboardButton("1 день - 290 рублей", callback_data='subscription_1_day')],
-                [InlineKeyboardButton("7 дней - 1490 рублей", callback_data='subscription_7_days')],
-                [InlineKeyboardButton("30 дней - 4990 рублей", callback_data='subscription_30_days')],
+                [InlineKeyboardButton("1 день - 290 рублей", url='https://www.youtube.com/watch?v=dQw4w9WgXcQ')],
+                [InlineKeyboardButton("7 дней - 1490 рублей", url=f'https://kirbudilovcoach.payform.ru/?order_id={user_id}&subscription={subscription_7_id}&do=pay&urlSuccess={url_7_success}')],
+                [InlineKeyboardButton("30 дней - 4990 рублей", url=f'https://kirbudilovcoach.payform.ru/?order_id={user_id}&subscription={subscription_30_id}&do=pay&urlSuccess={url_30_success}')],
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await context.bot.send_message(
@@ -247,7 +252,19 @@ class ChatGPTTelegramBot:
         return True
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        args = context.args
         chat_id = update.message.chat_id
+
+        if args and args[0].startswith("subscription_paid_"):
+            # https://t.me/youtube_assistant_dev2_bot?start=subscription_paid_7_days_627512965
+            _, _, days, _, user_id = args[0].split("_")
+            # Здесь вы можете добавить логику для определения срока окончания подписки и отправки сообщения пользователю
+            has_subscription = await self.check_subscription_status(user_id, "nothing")
+
+            if has_subscription:
+                await update.message.reply_text(
+                    f"Спасибо за покупку подписки на {days} дней! Ваша подписка активна.")
+                return
 
         await context.bot.send_photo(chat_id=chat_id, photo='start_photo.jpg')
         await update.message.reply_text(
@@ -327,7 +344,7 @@ class ChatGPTTelegramBot:
                                                text="Некорректный URL. Пожалуйста, введи правильную ссылку на видео YouTube.")
 
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # user_id = update.message.from_user.id
+        user_id = update.callback_query.from_user.id
         chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat_id
         query = update.callback_query
         await query.answer()
@@ -352,22 +369,15 @@ class ChatGPTTelegramBot:
             await self.create_new_shorts(update, context)
         elif query.data == "info":
             await self.info(update, context)
-        elif query.data == 'subscription_1_day':
-            # payment_url = "https://kirbudilovcoach.payform.ru/?do=pay&products"
-            # link = "https://kirbudilovcoach.payform.ru/?order_id=test&products[0][price]=2000&products[0][quantity]=1&products[0][name]=Обучающие материалы&customer_extra=Полная оплата курса&do=pay"
-            # prodamus = prodamuspy.PyProdamus(os.environ['PRODAMUS_TOKEN'])
-            # bodyDict = prodamus.parse(body)
-            # checkSign = prodamus.sign(bodyDict)
-            payment_url = "https://kirbudilovcoach.payform.ru/subscription_1_day"
-        elif query.data == 'subscription_7_days':
-            payment_url = "https://kirbudilovcoach.payform.ru/?do=pay&products"
-            current_datetime = datetime.now().strftime("%Y%m%d%H%M%S")
-            order_id = f"{user_id}_{current_datetime}"
-            link = "https://kirbudilovcoach.payform.ru/?order_id=test&products[0][price]=1490&products[0][quantity]=1&subscription=1779399&do=pay"
-            payment_url = "https://kirbudilovcoach.payform.ru/subscription_7_days"
-        elif query.data == 'subscription_30_days':
-
-            payment_url = "https://kirbudilovcoach.payform.ru/subscription_30_days"
+        elif query.data == "account":
+            await self.account(update, context)
+        # elif query.data == 'subscription_1_day':
+        #     payment_url = f"https://kirbudilovcoach.payform.ru/?do=pay&products"
+        # elif query.data == 'subscription_7_days':
+        #     payment_url = f"https://kirbudilovcoach.payform.ru/?order_id={user_id}&subscription=1779399&do=pay"
+        #     user_id = update.message.from_user.id
+        # elif query.data == 'subscription_30_days':
+        #     payment_url = f"https://kirbudilovcoach.payform.ru/?order_id={user_id}&subscription=1779400&do=pay"
 
     async def menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
@@ -764,7 +774,7 @@ class ChatGPTTelegramBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="Для того, чтобы связаться с поддержкой, нажмите по кнопке ниже 🎥",
+            text="[В разработке]\n\nДля того, чтобы связаться с поддержкой, нажмите по кнопке ниже 🎥",
             reply_markup=reply_markup
         )
 
@@ -782,66 +792,97 @@ class ChatGPTTelegramBot:
         await self.start(update, context)
 
     async def info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        keyboard = [
-            [InlineKeyboardButton("1 день - 290 рублей", callback_data='subscription_1_day')],
-            [InlineKeyboardButton("7 дней - 1490 рублей", callback_data='subscription_7_days')],
-            [InlineKeyboardButton("30 дней - 4990 рублей", callback_data='subscription_30_days')],
+        user_id = update.effective_user.id
+        subscription_7_id = 1779399
+        subscription_30_id = 1779400
+        url_7_success = f"https://t.me/youtube_assistant_dev2_bot?start=subscription_paid_7_days_{user_id}"
+        url_30_success = f"https://t.me/youtube_assistant_dev2_bot?start=subscription_paid_30_days_{user_id}"
+
+        keyboard_demo = [
+            [InlineKeyboardButton("1 день - 290 рублей", url='https://www.youtube.com/watch?v=dQw4w9WgXcQ')],
+            [InlineKeyboardButton("7 дней - 1490 рублей",
+                                  url=f'https://kirbudilovcoach.payform.ru/?order_id={user_id}&subscription={subscription_7_id}&do=pay&urlSuccess={url_7_success}')],
+            [InlineKeyboardButton("30 дней - 4990 рублей",
+                                  url=f'https://kirbudilovcoach.payform.ru/?order_id={user_id}&subscription={subscription_30_id}&do=pay&urlSuccess={url_30_success}')],
         ]
+        keyboard = [
+            [InlineKeyboardButton("Меню", callback_data='view_features')],
+            [InlineKeyboardButton("Личный кабинет", callback_data='account')],
+        ]
+        reply_markup_demo = InlineKeyboardMarkup(keyboard_demo)
         reply_markup = InlineKeyboardMarkup(keyboard)
+
+        with Session() as session:
+            user = session.query(User).filter(User.id == user_id).first()
+            if user:
+                subscription = session.query(Subscription).filter(Subscription.user_id == user_id).first()
+                if subscription:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=f"Привет, я твой карманный YouTube продюсер 👋🏻  \n\n"
+                             f"Создатель назвал меня Сильвия, но для тебя я буду ассистентом по старту твоего канала на YouTube 🎥 \n\n"
+                             f"Я существую, чтобы ты сэкономил сотни тысяч рублей на найме команды или на дорогом продакшне и начал получать первые просмотры уже сегодня вечером❤\n\n"
+                             f"Я придумаю за тебя сценарии и даже пропишу теги к видео, тебе останется лишь снять и выложить ролик 😻\n\n"
+                             f"Поздравляю! У тебя уже подключен тариф: {subscription.tariff} \n\n"
+                             f"Можешь полноценно пользоваться функциями и развивать свой YouTube канал 😉",
+                        reply_markup=reply_markup
+                    )
+                    return
+
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"Информация о проекте👇🏻\n\n"
-                 f"Привет, я твой карманный YouTube продюсер 👋🏻  \n\n"
+            text=f"Привет, я твой карманный YouTube продюсер 👋🏻  \n\n"
                  f"Создатель назвал меня Сильвия, но для тебя я буду ассистентом по старту твоего канала на YouTube 🎥 \n\n"
                  f"Я существую, чтобы ты сэкономил сотни тысяч рублей на найме команды или на дорогом продакшне и начал получать первые просмотры уже сегодня вечером❤\n\n"
                  f"Я придумаю за тебя сценарии и даже пропишу теги к видео, тебе останется лишь снять и выложить ролик 😻\n\n"
                  f"По умолчанию ты можешь воспользоваться любыми функциями 2 раза без оплаты\n\n"
                  f"Чтобы пользоваться ботом без ограничений, необходимо оформить подписку\n\n"
                  f"Выбери желаемый тариф и в течение 5-10 минут после оплаты я пришлю тебе сообщение👇🏻\n\n",
-            reply_markup=reply_markup
+            reply_markup=reply_markup_demo
         )
 
     async def account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Добро пожаловать, *Имя*
-
-        Ваш текущий тариф: демо
-        Дата окончания:  —
-
-        (Или же та, которая в кабинете)
-
-        Чтобы пользоваться ботом без ограничений, необходимо  оформить подписку 👇🏻
-
-        Узнать о тарифных планах (кнопка вызывает окошко - информация о проекте)
-
-        Наши другие сервисы (здесь ссылка на сайт fabricbot.ru)
-        """
-        user_id = update.message.from_user.id
+        user_id = update.message.from_user.id if update.message else update.effective_user.id
+        # chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat_id
         name = "Аноним"
         tariff_info = "демо"
-        expiration_date = "—"
+        keyboard = [
+            [InlineKeyboardButton("Наши другие сервисы", url="https://fabricbot.ru")]
+        ]
+        keyboard_demo = [
+            [InlineKeyboardButton("Узнать о тарифных планах", callback_data='info')],
+            [InlineKeyboardButton("Наши другие сервисы", url="https://fabricbot.ru")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        reply_markup_demo = InlineKeyboardMarkup(keyboard_demo)
         with Session() as session:
             user = session.query(User).filter(User.id == user_id).first()
             if user:
                 name = user.name or name
                 subscription = session.query(Subscription).filter(Subscription.user_id == user_id).first()
                 if subscription:
-                    # Предполагается, что статус подписки хранится в поле status
-                    tariff_info = subscription.status
+                    tariff_info = subscription.tariff
                     # Дата окончания подписки в формате YYYY-MM-DD
                     expiration_date = subscription.expiration_date.strftime("%Y-%m-%d")
-            keyboard = [
-                [InlineKeyboardButton("Узнать о тарифных планах", callback_data='info')],
-                [InlineKeyboardButton("Наши другие сервисы", url="https://fabricbot.ru")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=f"Добро пожаловать, {name}!\n\n"
+                             f"Ваш текущий тариф: {tariff_info}\n"
+                             f"Дата окончания:  {expiration_date}\n\n",
+                        reply_markup=reply_markup
+                    )
+                    return
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"Добро пожаловать, {name}!\n\n"
-                     f"Ваш текущий тариф: {tariff_info}\n"
-                     f"Дата окончания:  {expiration_date}\n\n"
+                     f"Ваш текущий тариф: {tariff_info}\n\n"
+                     f"Бесплатные попытки:\n"
+                     f"--Упаковка канала: {user.naming_free_uses}\n"
+                     f"--Создание сцериев видео: {user.shorts_free_uses}\n"
+                     f"--Создание сценариев shorts: {user.video_free_uses}\n"
+                     f"--SEO для роликов: {user.seo_free_uses}\n\n"
                      f"Чтобы пользоваться ботом без ограничений, необходимо оформить подписку 👇🏻",
-                reply_markup=reply_markup
+                reply_markup=reply_markup_demo
             )
 
     async def referral(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -851,7 +892,7 @@ class ChatGPTTelegramBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"За каждого приглашенного пользователя, который оплатил любую подписку, я буду дарить тебе 20% от ее стоимости, воспользоваться ты ей можешь, оплатив любой тариф при достаточно балансе\n\n"
+            text=f"[В разработке]\n\nЗа каждого приглашенного пользователя, который оплатил любую подписку, я буду дарить тебе 20% от ее стоимости, воспользоваться ты ей можешь, оплатив любой тариф при достаточно балансе\n\n"
                  f"Для этого человек должен быть авторизован по вашей реферальной ссылке: *реф ссылка персонализированная* - она выдается через телеграм апи\n\n"
                  f"Для активации нужно связаться с поддержкой",
             reply_markup=reply_markup

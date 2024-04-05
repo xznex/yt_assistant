@@ -24,7 +24,9 @@ class Subscription(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(BigInteger, ForeignKey('users.id'))  # Внешний ключ для связи с таблицей пользователей
-    order_id = Column(String, nullable=False)
-    status = Column(String, default="demo")
-    expiration_date = Column(DateTime, nullable=True)  # Дата истечения подписки
+    order_id = Column(BigInteger, nullable=False)
+    subscription_id = Column(BigInteger, nullable=False)
+    tariff = Column(String, default="demo")
+    email = Column(String, nullable=False)
+    expiration_date = Column(DateTime, nullable=False)  # Дата истечения подписки
     user = relationship("User", back_populates="subscriptions")  # Обратное отношение к пользователю

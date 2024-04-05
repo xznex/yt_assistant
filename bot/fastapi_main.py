@@ -1,20 +1,13 @@
 import os
-import sys
 from datetime import timedelta, datetime
-from pathlib import Path
-from typing import List
 
 import prodamuspy
 from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 import uvicorn
 
 load_dotenv()
-
-# root_dir = Path(__file__).resolve().parents[1]
-# print(root_dir)
-# sys.path.append(str(root_dir))
 
 from database import Session
 from models import User, Subscription
@@ -23,46 +16,19 @@ app = FastAPI()
 
 prodamus = prodamuspy.ProdamusPy(os.environ['PRODAMUS_TOKEN'])
 
-print(prodamus)
-class Product(BaseModel):
-    name: str
-    price: str
-    quantity: str
-    sum: str
 
-
-class PaymentNotification(BaseModel):
-    date: str
-    order_id: str
-    order_num: str
-    domain: str
-    sum: str
-    customer_phone: str
-    customer_email: str
-    customer_extra: str
-    payment_type: str
-    commission: str
-    commission_sum: str
-    attempt: str
-    sys: str
-    products: List[Product]
-    payment_status: str
-    payment_status_description: str
-
-
-def calculate_expiration_date(start_date_str: str, sum: float) -> datetime:
-    # Преобразование строки с датой начала в объект datetime
+# Расчёт даты истечения подписки
+def calculate_expiration_date(start_date_str: str, sub_id: int) -> datetime:
     start_date = datetime.strptime(start_date_str, "%Y-%m-%dT%H:%M:%S%z")
 
     # Определение количества дней для добавления
-    if sum == 1490.00:
+    if sub_id == 1779399:
         days_to_add = 7
-    elif sum == 4990.00:
+    elif sub_id == 1779400:
         days_to_add = 30
     else:
-        days_to_add = 0  # Или задайте значение по умолчанию
+        days_to_add = 0
 
-    # Расчёт даты истечения подписки
     expiration_date = start_date + timedelta(days=days_to_add)
 
     return expiration_date
@@ -70,65 +36,74 @@ def calculate_expiration_date(start_date_str: str, sum: float) -> datetime:
 
 @app.get("/")
 async def read_root():
-    return {"message": "Hello World!"}
+    return JSONResponse(content={"success": True}, status_code=200)
 
 
 @app.post("/prodamus-webhook")
 async def handle_webhook(request: Request):
-    print(request.headers.get('Content-Type'))
-    body_str = await request.body()
-    body_str_decoded = body_str.decode("utf-8")  # Декодируем тело запроса из байтов в строку
+    try:
+        """
+        {'date': '2024-04-04T20:06:13+03:00', 'order_id': '20344147', 'order_num': '627512965', 
+        'domain': 'kirbudilovcoach.payform.ru', 'sum': '1490.00', 'currency': 'rub', 'customer_phone': '+79999999999', 
+        'customer_email': 'test@yandex.ru', 'customer_extra': '', 'payment_type': 'Оплата картой, выпущенной в РФ', 
+        'commission': '3.5', 'commission_sum': '52.15', 'attempt': '1', 'products': [{'name': 'Доступ к чат-боту YouTube
+         ассистент на 7 дней ', 'price': '1490.00', 'quantity': '1', 'sum': '1490.00'}], 'subscription': 
+         {'id': '1779399', 'profile_id': '564457', 'demo': '1', 'active_manager': '1', 'active_manager_date': '',
+          'active_user': '1', 'active_user_date': '', 'cost': '1490.00', 'currency': 'rub', 'name': 'Доступ к чат-боту
+           YouTube ассистент на 7 дней ', 'limit_autopayments': '', 'autopayments_num': '0', 'first_payment_discount':
+            '0.00', 'next_payment_discount': '0.00', 'next_payment_discount_num': '', 'date_create': '2024-04-04 20:05:54',
+             'date_first_payment': '2024-04-04 20:05:54', 'date_last_payment': '2024-04-04 20:05:54',
+              'date_next_payment': '2024-04-11 20:05:54', 'date_alt_next_payment': '', 'date_next_payment_discount':
+               '2024-04-04 20:05:54', 'date_completion': '', 'payment_num': '1', 'notification': '0',
+                'process_started_at': '', 'autopayment': '0'}, 'payment_status': 'success', 'payment_status_description':
+                 'Успешная оплата', 'payment_init': 'manual'}
+        заносим user_id (order_num), order_id, subscription_id, tariff, email, expiration_date и объект user
+        """
+        # application/x-www-form-urlencoded
+        body_str = await request.body()
+        body_str_decoded = body_str.decode("utf-8")  # Декодируем тело запроса из байтов в строку
 
-    # Преобразование полученной строки в словарь с помощью функции parse
-    data = prodamus.parse(body_str_decoded)
+        # Преобразование полученной строки в словарь с помощью функции parse
+        data = prodamus.parse(body_str_decoded)
 
-    # data['order_id'] = '1'
-    # data['user_id'] = 1712103633  # Предполагается, что order_id имеет формат user_id_datetime
+        received_sign = request.headers.get("sign")
 
-    print(data)
+        print(str(data))
 
-    # order_id = '1'
-    user_id = 1712103633  # Предполагается, что order_id имеет формат user_id_datetime
+        if not prodamus.verify(data, received_sign):
+            print("problems", str(data))
+            raise HTTPException(status_code=403, detail="Invalid signature")
 
-    received_sign = request.headers.get("X-Signature")
+        order_id = int(data.get('order_id'))
+        user_id = int(data.get('order_num'))
+        subscription_id = int(data['subscription']['id'])
+        tariff = data['subscription']['name']
+        email = data.get('customer_email')
+        expiration_date = calculate_expiration_date(data.get('date'), subscription_id)
 
-    # Проверка подписи
-    if not prodamus.verify(data, received_sign):
-        print("problems", received_sign)
-        raise HTTPException(status_code=403, detail="Invalid signature")
+        if data.get('payment_status') != 'success':
+            raise HTTPException(status_code=403, detail="Invalid payment_status")
 
-    order_id = data.get('order_id')
-    user_id = order_id.split('_')[0]  # Предполагается, что order_id имеет формат user_id_datetime
+        # Поиск пользователя и обновление информации о подписке
+        with Session() as session:
+            subscription = session.query(Subscription).filter_by(order_id=order_id).first()
+            if not subscription:
+                user = session.query(User).filter(User.id == user_id).first()
+                subscription = Subscription(order_id=order_id, user_id=user_id, subscription_id=subscription_id,
+                                            tariff=tariff, email=email, expiration_date=expiration_date, user=user)
+                session.add(subscription)
+            else:
+                subscription.subscription_id = subscription_id
+                subscription.tariff = tariff
+                subscription.email = email
+                subscription.expiration_date = expiration_date
+            session.commit()
+    except Exception as e:
+        print(f"Произошла ошибка при обработке веб-хука: {e}")
+        # Возврат успешного статуса, несмотря на внутреннюю ошибку
+        return JSONResponse(content={"success": True}, status_code=200)
 
-    payment_status = None
-    if data.get('payment_status') == 'success':
-        payment_status = "оплачено"
-    expiration_date = calculate_expiration_date(data.get('date'), data.get('sum'))
-
-    # Теперь data это словарь с данными, которые вы можете использовать
-    # Например, вы можете обработать статус платежа и order_id здесь
-    print(f"Order ID: {data.get('order_id')}, Status: {data.get('payment_status')}")
-
-    # Поиск пользователя и обновление информации о подписке
-    with Session() as session:
-        subscription = session.query(Subscription).filter_by(order_id=order_id).first()
-        if not subscription:
-            user = session.query(User).filter(User.id == user_id).first()
-            subscription = Subscription(order_id=order_id, user_id=user_id, expiration_date=expiration_date, user=user)
-            if payment_status:
-                subscription.status = payment_status
-            session.add(subscription)
-        else:
-            subscription.status = payment_status
-            subscription.expiration_date = expiration_date
-        session.commit()
-
-    return {"success": True}
+    return JSONResponse(content={"success": True}, status_code=200)
 
 if __name__ == '__main__':
     uvicorn.run("fastapi_main:app", host="0.0.0.0", port=8000, log_level="info")
-
-"""
-curl -X POST http://localhost:8000/prodamus-webhook -H "Content-Type: application/x-www-form-urlencoded" -H "X-Signature: c0eced1737e9fc3983d1c78cbd79ebe53bfc39b42b73d59b5cc19823a793107b" --data-urlencode "date=2024-04-02T00:00:00+03:00" --data-urlencode "order_id=1" --data-urlencode "order_num=test" --data-urlencode "domain=kirbudilovcoach.payform.ru" --data-urlencode "sum=1000.00" --data-urlencode "customer_phone=+79999999999" --data-urlencode "customer_email=email@domain.com" --data-urlencode "customer_extra=тест" --data-urlencode "payment_type=Пластиковая карта Visa, MasterCard, МИР" --data-urlencode "commission=3.5" --data-urlencode "commission_sum=35.00" --data-urlencode "attempt=1" --data-urlencode "sys=test" --data-urlencode "products[0][name]=Доступ к обучающим материалам" --data-urlencode "products[0][price]=1000.00" --data-urlencode "products[0][quantity]=1" --data-urlencode "products[0][sum]=1000.00" --data-urlencode "payment_status=success" --data-urlencode "payment_status_description=Успешная оплата"
-
-"""
