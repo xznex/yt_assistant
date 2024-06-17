@@ -16,3 +16,5 @@ gtts
 whois
 Pillow
 youtube-transcript-api
+pandas
+xlsxwriter

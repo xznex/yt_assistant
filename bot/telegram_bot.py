@@ -6,17 +6,18 @@ import io
 import logging
 import os
 import re
-from functools import wraps
 from uuid import uuid4
 
+import httpx
 from PIL import Image
 from pydub import AudioSegment
 from telegram import BotCommandScopeAllGroupChats, Update, constants
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, InlineQueryResultArticle
 from telegram import InputTextMessageContent, BotCommand
-from telegram.error import RetryAfter, TimedOut, BadRequest
+from telegram.constants import ParseMode
+from telegram.error import RetryAfter, TimedOut, BadRequest, TelegramError
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, \
-    filters, InlineQueryHandler, CallbackQueryHandler, Application, ContextTypes, CallbackContext
+    filters, CallbackQueryHandler, Application, ContextTypes, CallbackContext
 
 from openai_helper import OpenAIHelper, localized_text
 from usage_tracker import UsageTracker
@@ -26,59 +27,22 @@ from utils import is_group_chat, get_thread_id, message_text, wrap_with_indicato
     cleanup_intermediate_files
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled, \
     TranslationLanguageNotAvailable
-import prodamuspy
 
 from database import Session
 from models import User, Subscription
 
-"""
-    TODO: добавить кнопки (меню, личный кабинет, информация о проекте, связаться с поддержкой, реферальная система)
+from octoparse import Octoparse
+import json
+from parser import parser
 
-    В личном кабинете должна быть инфа о текущем тарифе
 
-    личный кабинет:
-        Добро пожаловать, *Имя*
-        
-        Ваш текущий тариф: демо
-        Дата окончания:  —
-        
-        (Или же та, которая в кабинете) 
-        
-        Чтобы пользоваться ботом без ограничений, необходимо  оформить подписку 👇🏻
-        
-        Узнать о тарифных планах (кнопка вызывает окошко - информация о проекте)
-        
-        Наши другие сервисы (здесь ссылка на сайт fabricbot.ru)
-    информация о проекте:
-        Информация о проекте👇🏻
+AWAITING_USER_ID, AWAITING_MESSAGE_TEXT, AWAITING_FILE = range(3)
+ADMIN_CHAT_ID = 627512965
+ADMINS_CHAT_ID = [627512965, 5235703016, 71087432]
 
-        Привет, я твой карманный YouTube продюсер 👋🏻  
-        
-        Создатель назвал меня Сильвия, но для тебя я буду ассистентом по старту твоего канала на YouTube 🎥  
-        
-        Я существую, чтобы ты сэкономил сотни тысяч рублей на найме команды или на дорогом продакшне и начал получать первые просмотры уже сегодня вечером❤️  
-        
-        Я придумаю за тебя сценарии и даже пропишу теги к видео, тебе останется лишь снять и выложить ролик 😻
-        
-        По умолчанию ты можешь воспользоваться любыми функциями 2 раза без оплаты 
-        
-        Чтобы пользоваться ботом без ограничений, необходимо оформить подписку 
-        
-        Выбери желаемый тариф и в течение 5-10 минут после оплаты я пришлю тебе сообщение👇🏻
-        
-        Тарифы в виде кнопок
-        
-        1 день - 290 рублей 
-        7 дней - 1490 рублей
-        30 дней - 4990 рублей
-    реферальная система:
-        За каждого приглашенного пользователя, который оплатил любую подписку, я буду дарить тебе 20% от ее стоимости, воспользоваться ты ей можешь, оплатив любой тариф при достаточно балансе
-
-        Для этого человек должен быть авторизован по вашей реферальной ссылке: *реф ссылка персонализированная* - она выдается через телеграмм апи 
-        
-        Для активации нужно связаться с поддержкой: @fabricbothelper
-    
-"""
+# Устанавливаем уровень логгирования, чтобы видеть ошибки
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class UserContext:
@@ -91,6 +55,14 @@ class UserContext:
         self._name = None  # имя
         self._channel_description = None  # True или False
         self._channel_idea = None  # строка
+        self._analytics_channel_description = None
+        self._analytics_channel_audience = None
+        self._analytics_channel_goals = None
+        self._analytics_words = None
+        self._analytics_links = None
+        self._analytics_channel_characteristics = None
+        self.admin_chat_id_of_user_for_send_file = None
+        self.admin_text_to_send_all_users = None
 
     def update_user_name(self, user_id, new_name):
         with Session() as session:
@@ -133,20 +105,84 @@ class UserContext:
             self._channel_idea = new_idea
             session.commit()
 
-    # def save_description_and_idea(self, user_id, new_description, new_idea):
-    #     with Session() as session:
-    #         user = session.query(User).filter(User.id == user_id).first()
-    #
-    #         if not user:
-    #             new_user = User(id=user_id, channel_description=new_description, channel_idea=new_idea)
-    #             session.add(new_user)
-    #         else:
-    #             user.channel_description = new_description
-    #             user.channel_idea = new_idea
-    #
-    #         self._channel_description = new_description
-    #         self._channel_idea = new_idea
-    #         session.commit()
+    def save_analytics_channel_description(self, user_id, analytics_channel_description):
+        with Session() as session:
+            user = session.query(User).filter(User.id == user_id).first()
+
+            if not user:
+                new_user = User(id=user_id, analytics_channel_description=analytics_channel_description)
+                session.add(new_user)
+            else:
+                user.analytics_channel_description = analytics_channel_description
+
+            self._analytics_channel_description = analytics_channel_description
+            session.commit()
+
+    def save_analytics_channel_audience(self, user_id, analytics_channel_audience):
+        with Session() as session:
+            user = session.query(User).filter(User.id == user_id).first()
+
+            if not user:
+                new_user = User(id=user_id, analytics_channel_audience=analytics_channel_audience)
+                session.add(new_user)
+            else:
+                user.analytics_channel_audience = analytics_channel_audience
+
+            self._analytics_channel_audience = analytics_channel_audience
+            session.commit()
+
+    def save_analytics_channel_goals(self, user_id, analytics_channel_goals):
+        with Session() as session:
+            user = session.query(User).filter(User.id == user_id).first()
+
+            if not user:
+                new_user = User(id=user_id, analytics_channel_goals=analytics_channel_goals)
+                session.add(new_user)
+            else:
+                user.analytics_channel_goals = analytics_channel_goals
+
+            self._analytics_channel_goals = analytics_channel_goals
+            session.commit()
+
+    def save_analytics_words(self, user_id, analytics_words):
+        print("Тут ошибка 2")
+        with Session() as session:
+            user = session.query(User).filter(User.id == user_id).first()
+
+            if not user:
+                new_user = User(id=user_id, analytics_words=analytics_words)
+                session.add(new_user)
+            else:
+                user.analytics_words = analytics_words
+
+            self._analytics_words = analytics_words
+            session.commit()
+
+    def save_analytics_links(self, user_id, analytics_links):
+        with Session() as session:
+            user = session.query(User).filter(User.id == user_id).first()
+
+            if not user:
+                new_user = User(id=user_id, analytics_links=analytics_links)
+                session.add(new_user)
+            else:
+                user.analytics_links = analytics_links
+
+            self._analytics_links = analytics_links
+            session.commit()
+
+    def save_analytics_channel_characteristics(self, user_id, analytics_channel_characteristics):
+        with Session() as session:
+            user = session.query(User).filter(User.id == user_id).first()
+
+            if not user:
+                new_user = User(id=user_id, analytics_channel_characteristics=analytics_channel_characteristics)
+                session.add(new_user)
+            else:
+                user.analytics_channel_characteristics = analytics_channel_characteristics
+
+            self._analytics_channel_characteristics = analytics_channel_characteristics
+            session.commit()
 
 
 class ChatGPTTelegramBot:
@@ -168,12 +204,14 @@ class ChatGPTTelegramBot:
             BotCommand(command='info', description="Информация о проекте"),
             BotCommand(command='menu', description="Меню"),
             BotCommand(command='account', description="Личный кабинет"),
+            BotCommand(command='analytics', description="Получить аналитику видео"),
             BotCommand(command='naming', description="Упаковка канала"),
             BotCommand(command='video', description="Создать сценарий видео"),
             BotCommand(command='shorts', description="Создать сценарий shorts"),
             BotCommand(command='seo', description="Придумать название и описание к видео"),
             BotCommand(command='referral', description="Реферальная система"),
             BotCommand(command='support', description="Связаться с поддержкой"),
+            BotCommand(command='faq', description="Служба поддержки"),
             BotCommand(command='restart', description="Перезапуск бота"),
         ]
         # If imaging is enabled, add the "image" command to the list
@@ -208,6 +246,14 @@ class ChatGPTTelegramBot:
             free_uses_attr = f"{feature}_free_uses"
             free_uses = getattr(user, free_uses_attr, 0)
 
+            if feature == 'analytics_attempts':
+                if user.analytics_attempts > 0:
+                    user.analytics_attempts -= 1
+                    session.commit()
+                    return True
+                else:
+                    return False
+
             if free_uses > 0:
                 # Уменьшаем количество свободных попыток и возвращаем True
                 setattr(user, free_uses_attr, free_uses - 1)
@@ -225,21 +271,42 @@ class ChatGPTTelegramBot:
         # Нет действующей подписки и свободных попыток
         return False
 
-    async def check_and_handle_subscription_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE, feature: str):
+    async def get_short_url(self, user_id: int):
+        url_1_success = f"https://t.me/ytassistantbot?start=subscription_paid_1_days_{user_id}"
+        prodamus_url = f"https://fabricbot.payform.ru/?order_id={user_id}&products[0][price]=290&products[0][quantity]=1&products[0][name]=Доступ к чат-боту YouTube ассистент на 1 день&do=link&urlSuccess={url_1_success}"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(prodamus_url)
+            if response.status_code == 200:
+                # Извлечение укороченной ссылки из HTML ответа
+                match = re.search(r'https://payform.ru/[^\s"]+', response.text)
+                if match:
+                    return match.group(0)  # Возвращает найденную укороченную ссылку
+        return None  # Возвращает None, если ссылка не найдена
+
+    async def check_and_handle_subscription_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                                   feature: str):
         user_id = update.effective_user.id
         has_subscription = await self.check_subscription_status(user_id, feature)
 
         if not has_subscription:
             subscription_7_id = 1779399
             subscription_30_id = 1779400
-            url_7_success = f"https://t.me/youtube_assistant_dev2_bot?start=subscription_paid_7_days_{user_id}"
-            url_30_success = f"https://t.me/youtube_assistant_dev2_bot?start=subscription_paid_30_days_{user_id}"
-
+            short_url = await self.get_short_url(user_id)
+            short_url_analytics_1_sub_30 = await self.get_short_url_analytics_1_sub_30(user_id)
+            short_url_analytics_1 = await self.get_short_url_analytics_1(user_id)
+            url_7_success = f"https://t.me/ytassistantbot?start=subscription_paid_7_days_{user_id}"
+            url_30_success = f"https://t.me/ytassistantbot?start=subscription_paid_30_days_{user_id}"
             keyboard = [
-                [InlineKeyboardButton("1 день - 290 рублей", url='https://www.youtube.com/watch?v=dQw4w9WgXcQ')],
-                [InlineKeyboardButton("7 дней - 1490 рублей", url=f'https://kirbudilovcoach.payform.ru/?order_id={user_id}&subscription={subscription_7_id}&do=pay&urlSuccess={url_7_success}')],
-                [InlineKeyboardButton("30 дней - 4990 рублей", url=f'https://kirbudilovcoach.payform.ru/?order_id={user_id}&subscription={subscription_30_id}&do=pay&urlSuccess={url_30_success}')],
+                [InlineKeyboardButton("1 день - 290 рублей", url=short_url)],
+                [InlineKeyboardButton("7 дней - 1490 рублей",
+                                      url=f'https://fabricbot.payform.ru/?order_id={user_id}&subscription={subscription_7_id}&do=pay&urlSuccess={url_7_success}')],
+                [InlineKeyboardButton("30 дней - 4990 рублей",
+                                      url=f'https://fabricbot.payform.ru/?order_id={user_id}&subscription={subscription_30_id}&do=pay&urlSuccess={url_30_success}')],
+                [InlineKeyboardButton("30 дней + 1 аналитика конкурентов - 7990 рублей",
+                                      url=short_url_analytics_1_sub_30)],
+                [InlineKeyboardButton("1 Аналитика конкурентов - 4990 рублей", url=short_url_analytics_1)]
             ]
+
             reply_markup = InlineKeyboardMarkup(keyboard)
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
@@ -252,46 +319,113 @@ class ChatGPTTelegramBot:
         return True
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
         args = context.args
         chat_id = update.message.chat_id
+        user_id = update.message.from_user.id
+
+        # Проверяем, есть ли в контексте реферальный код
+        referral_code = context.args[0] if context.args else None
+
+        # analytics_1_success_ and analytics_1_sub_30_success_
+
+        if args and args[0].startswith("analytics_1_success_"):
+            await update.message.reply_text(
+                f"Спасибо за покупку товара \"1 Аналитика конкурентов\"! В течение нескольких минут эта возможность активируется и вы сможете создать 1 аналитику в разделе /analytics.")
+            return
+
+        if args and args[0].startswith("analytics_1_sub_30_success_"):
+            await update.message.reply_text(
+                f"Спасибо за покупку товара \"30 дней + 1 Аналитика конкурентов\"! В течение нескольких минут подписка активируется и вы сможете пользоваться полным функционалом без ограничений, а также иметь возможность создать 1 Аналитику в разделе /analytics.")
+            return
 
         if args and args[0].startswith("subscription_paid_"):
-            # https://t.me/youtube_assistant_dev2_bot?start=subscription_paid_7_days_627512965
+            # https://t.me/ytassistantbot?start=subscription_paid_7_days_627512965
             _, _, days, _, user_id = args[0].split("_")
             # Здесь вы можете добавить логику для определения срока окончания подписки и отправки сообщения пользователю
-            has_subscription = await self.check_subscription_status(user_id, "nothing")
+            # has_subscription = await self.check_subscription_status(user_id, "nothing")
 
-            if has_subscription:
+            # if has_subscription:
+            if days == '1':
                 await update.message.reply_text(
-                    f"Спасибо за покупку подписки на {days} дней! Ваша подписка активна.")
-                return
+                    f"Спасибо за покупку подписки на 1 день! В течение нескольких минут активируется и вы сможете пользоваться полным функционалом без ограничений.")
+            else:
+                await update.message.reply_text(
+                    f"Спасибо за покупку подписки на {days} дней! В течение нескольких минут и вы сможете пользоваться полным функционалом без ограничений.")
+            return
 
-        await context.bot.send_photo(chat_id=chat_id, photo='start_photo.jpg')
-        await update.message.reply_text(
-            "Привет, я твой карманный YouTube продюсер 👋🏻\n\n"
-            "Создатель назвал меня Сильвия, но для тебя я буду ассистентом по старту твоего канала на YouTube 🎥\n\n"
-            "Я существую, чтобы ты сэкономил сотни тысяч рублей на найме команды или на дорогом продакшне и начал получать первые просмотры уже сегодня вечером❤️\n\n"
-            "Я придумаю за тебя сценарии и даже пропишу теги к видео, тебе останется лишь снять и выложить ролик 😻",
-        )
-        await update.message.reply_text(
-            "Но для начала давай познакомимся, как тебя зовут?"
-        )
+        # Получаем объект пользователя
+        user = await context.bot.get_chat_member(chat_id, user_id)
 
-        self.user_states[update.effective_chat.id] = 'waiting_for_name'
+        # Получаем никнейм пользователя
+        if user.user.username:
+            nickname = user.user.username
+            text_start = f"Привет, {nickname}! Я твой карманный YouTube продюсер 👋🏻\n\n" \
+                         f"Создатель назвал меня Сильвия, но для тебя я буду ассистентом по старту твоего канала на YouTube 🎥\n\n" \
+                         f"Я существую, чтобы ты сэкономил сотни тысяч рублей на найме команды или на дорогом продакшне и начал получать первые просмотры уже сегодня вечером❤️\n\n" \
+                         f"Я придумаю за тебя сценарии и даже пропишу теги к видео, тебе останется лишь снять и выложить ролик 😻"
 
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.message.from_user.id
-        state = self.user_states.get(update.effective_chat.id)
-        chat_id = update.effective_chat.id
-        if state == 'waiting_for_name':
-            # Сохраняем имя пользователя
-            # self.user_context.name = update.message.text
+            await context.bot.send_video(chat_id=chat_id, video=open("video/Визитка.mp4", 'rb'),
+                                         caption=text_start)
 
             if chat_id not in self.user_contexts:
                 user_context = UserContext()
                 self.user_contexts[chat_id] = user_context
             else:
                 user_context = self.user_contexts[chat_id]
+
+            user_context.update_user_name(chat_id, nickname)
+
+            self.user_states[update.effective_chat.id] = 'awaiting_channel_description'
+
+            keyboard = [
+                [InlineKeyboardButton("Уже есть", callback_data='channel_exists')],
+                [InlineKeyboardButton("Собираюсь начать", callback_data='starting_channel')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"У тебя уже есть YouTube канал или ты только собираешься его начать?",
+                reply_markup=reply_markup
+            )
+        else:
+            # await context.bot.send_photo(chat_id=chat_id, photo='start_photo.jpg')
+            # await update.message.reply_text(
+            #     "Привет, я твой карманный YouTube продюсер 👋🏻\n\n"
+            #     "Создатель назвал меня Сильвия, но для тебя я буду ассистентом по старту твоего канала на YouTube 🎥\n\n"
+            #     "Я существую, чтобы ты сэкономил сотни тысяч рублей на найме команды или на дорогом продакшне и начал получать первые просмотры уже сегодня вечером❤️\n\n"
+            #     "Я придумаю за тебя сценарии и даже пропишу теги к видео, тебе останется лишь снять и выложить ролик 😻",
+            # )
+
+            text_start = f"Привет, я твой карманный YouTube продюсер 👋🏻\n\n" \
+                         f"Создатель назвал меня Сильвия, но для тебя я буду ассистентом по старту твоего канала на YouTube 🎥\n\n" \
+                         f"Я существую, чтобы ты сэкономил сотни тысяч рублей на найме команды или на дорогом продакшне и начал получать первые просмотры уже сегодня вечером❤️\n\n" \
+                         f"Я придумаю за тебя сценарии и даже пропишу теги к видео, тебе останется лишь снять и выложить ролик 😻"
+
+            await context.bot.send_video(chat_id=chat_id, video=open("video/Визитка.mp4", 'rb'),
+                                         caption=text_start)
+
+            await update.message.reply_text(
+                "Но для начала давай познакомимся, как тебя зовут?"
+            )
+
+            self.user_states[update.effective_chat.id] = 'waiting_for_name'
+
+    async def get_user_context(self, chat_id):
+        if chat_id not in self.user_contexts:
+            user_context = UserContext()
+            self.user_contexts[chat_id] = user_context
+        return self.user_contexts[chat_id]
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.message.from_user.id
+        state = self.user_states.get(update.effective_chat.id)
+        chat_id = update.effective_chat.id
+        user_context = await self.get_user_context(chat_id)
+
+        if state == 'waiting_for_name':
+            # Сохраняем имя пользователя
+            # self.user_context.name = update.message.text
 
             user_context.update_user_name(chat_id, update.message.text)
 
@@ -318,7 +452,6 @@ class ChatGPTTelegramBot:
             # await self.turnkey_generation(update, context)
         elif state == 'waiting_user_description':
             user_input = update.message.text
-            # self.user_input[update.effective_chat.id] = user_input
             await self.turnkey_generation(update, context, user_description=user_input)
         elif state == 'waiting_for_seo':
             user_input = update.message.text
@@ -332,7 +465,7 @@ class ChatGPTTelegramBot:
                 "Отлично! Ушла писать сценарии! 😇"
             )
             await self.create_new_shorts_handler(update, context, user_input)
-        if state == "awaiting_correct_url":
+        elif state == "awaiting_correct_url":
             try:
                 # Try processing the URL again
                 await self.seo_handler(update, context, update.message.text)
@@ -342,6 +475,146 @@ class ChatGPTTelegramBot:
                 # If still invalid, inform the user and wait for another attempt
                 await context.bot.send_message(chat_id=update.message.chat_id,
                                                text="Некорректный URL. Пожалуйста, введи правильную ссылку на видео YouTube.")
+        elif state == 'input_analytics_channel_description_handler':
+            user_context.save_analytics_channel_description(chat_id, update.message.text)
+            await self.input_analytics_channel_audience(update, context)
+        elif state == 'input_analytics_channel_audience_handler':
+            user_context.save_analytics_channel_audience(chat_id, update.message.text)
+            await self.input_analytics_channel_goals(update, context)
+        elif state == 'input_analytics_channel_goals_handler':
+            user_context.save_analytics_channel_goals(chat_id, update.message.text)
+            await self.input_analytics_last_step(update, context)
+        elif state == 'input_links_handler':
+            # user_context.save_analytics_channel_goals(chat_id, update.message.text)
+            await self.input_links_handler(update, context, update.message.text)
+        elif state == 'input_links_change_text_correct':
+            user_context = await self.get_user_context(chat_id)
+            user_context.save_analytics_channel_characteristics(user_id, update.message.text)
+            await update.message.reply_text(
+                "Отлично! Начала генерацию аналитики 😍"
+            )
+        elif state == 'admin_input_task_id':
+            # print(update.effective_chat.id)
+            await update.message.reply_text(
+                "Все! Как только генерация закончится, я пришлю и тебе и пользователю файл с сообщением. Например, 123-456-789? 123456789"
+            )
+            # task_id, chat_id = update.message.text.split(', ')
+            await self.monitor_task_and_get_data(update, context, update.message.text)
+        elif state == 'admin_input_task_id_test':
+            task_id, chat_id, *keys = update.message.text.split(', ')
+
+            print(keys)
+
+            octoparse = Octoparse()
+            print("пошел мониторинг")
+            while True:
+                status = octoparse.is_task_running(task_id=task_id)
+
+                # если задача выполнена, выходим из цикла
+                if not status:
+                    break
+
+                # ожидаем некоторое время перед повторной проверкой
+                print("прошло 30 секунд")
+                await asyncio.sleep(30)  # например, каждые 30 секунд
+
+            # если status стал False, продолжаем выполнение кода
+            print('получение данных')
+            data = octoparse.get_task_data(task_id=task_id)
+
+            cleaned_data = []
+            for item in data:
+                item["Video_Title"] = item["Video_Title"].strip()
+                cleaned_data.append(item)
+
+            # print(data)
+            print("данные получены")
+            try:
+
+                # Открыть файл и загрузить данные
+                print("Открыть файл и загрузить данные")
+
+                json_data = json.dumps(cleaned_data, ensure_ascii=False)
+
+                with open(f'analytics_data/data_{task_id}.json', 'w', encoding='utf-8') as f:
+                    f.write(json_data)
+                    print("Данные успешно сохранены в JSON файл")
+                    print("данные отправились в парсер")
+                    result_output_file_path = await parser(f'analytics_data/data_{task_id}.json', keys)
+                    print("данные вернулись из парсера и отправляются пользователю")
+                    await update.effective_message.chat.send_action(constants.ChatAction.UPLOAD_DOCUMENT)
+
+                    # os.path.basename(file_path)
+                    print(result_output_file_path, "ВОТ ЗДЕСЬ ПРОБЛЕМА?")
+                    with open(result_output_file_path, 'rb') as file:
+                        await context.bot.send_document(chat_id=chat_id, document=file,
+                                                        filename=f'{result_output_file_path}',
+                                                        caption="Я провела аналитику, ниже отправила тебе файл 🙏🏻\n\nКак им пользоваться? \n\nВ этой таблице ролики твоих конкурентов, отсортированные из объема в 7-10 тысяч, по определенным критериям таким как просмотры, "
+                                                                "дата публикации и т.д.\n\nВсего есть 3 параметра - лучшие видео за последнюю неделю, месяц и год \n\nТы можешь изучить этот контент и снять видео на похожие темы, либо даже полностью повторить их, все они — трендовые, "
+                                                                "ибо собрали большие просмотры за короткий промежуток времени\n\nПроще говоря, из 7000 видео, которые уже сняли твои конкуренты, я выбрала 100-200 штук, уверена, больше 30 из них подойдут, чтобы твой канал начал активно "
+                                                                "развиваться 📽\n\nДля анализа я взяла не только русских авторов, но и тех, кто создает видео на Английском языке\n\n*В таблице могут попадаться лишние темы, пока пропусти их, я активно работаю над этим🌟*\n\nЕсли у тебя "
+                                                                "есть вопросы по самому YouTube и ты хочешь получить максимум эффекта, напиши моему создателю @fabricbothelper")
+
+                    for chat_admin_id in ADMINS_CHAT_ID:
+                        with open(result_output_file_path, 'rb') as file:
+                            await context.bot.send_document(chat_id=chat_admin_id, document=file,
+                                                            filename=f'{result_output_file_path}',
+                                                            caption="Я провела аналитику, ниже отправила тебе файл 🙏🏻\n\nКак им пользоваться? \n\nВ этой таблице ролики твоих конкурентов, отсортированные из объема в 7-10 тысяч, по определенным критериям таким как просмотры, "
+                                                                    "дата публикации и т.д.\n\nВсего есть 3 параметра - лучшие видео за последнюю неделю, месяц и год \n\nТы можешь изучить этот контент и снять видео на похожие темы, либо даже полностью повторить их, все они — трендовые, "
+                                                                    "ибо собрали большие просмотры за короткий промежуток времени\n\nПроще говоря, из 7000 видео, которые уже сняли твои конкуренты, я выбрала 100-200 штук, уверена, больше 30 из них подойдут, чтобы твой канал начал активно "
+                                                                    "развиваться 📽\n\nДля анализа я взяла не только русских авторов, но и тех, кто создает видео на Английском языке\n\n*В таблице могут попадаться лишние темы, пока пропусти их, я активно работаю над этим🌟*\n\nЕсли у тебя "
+                                                                    "есть вопросы по самому YouTube и ты хочешь получить максимум эффекта, напиши моему создателю @fabricbothelper")
+            except Exception as e:
+                print(f"Ошибка при сохранении данных в JSON файл: {e}")
+
+        elif state == 'ai_faq':
+            await self.prompt(update=update, context=context)
+        elif state == 'admin_send_excel_user':
+            user_context = await self.get_user_context(chat_id)
+            user_context.admin_chat_id_of_user_for_send_file = update.message.text
+            file_path = 'output_analytics_data/Dmitry2.json.xlsx'
+            os.path.basename(file_path)
+
+            with open(file_path, 'rb') as file:
+                await context.bot.send_document(chat_id=update.message.text, document=file,
+                                                filename='Аналитика.xlsx',
+                                                caption="Я провела аналитику, ниже отправила тебе файл 🙏🏻\n\nКак им пользоваться? \n\nВ этой таблице ролики твоих конкурентов, отсортированные из объема в 7-10 тысяч, по определенным критериям таким как просмотры, "
+                                                        "дата публикации и т.д.\n\nВсего есть 3 параметра - лучшие видео за последнюю неделю, месяц и год \n\nТы можешь изучить этот контент и снять видео на похожие темы, либо даже полностью повторить их, все они — трендовые, "
+                                                        "ибо собрали большие просмотры за короткий промежуток времени\n\nПроще говоря, из 7000 видео, которые уже сняли твои конкуренты, я выбрала 100-200 штук, уверена, больше 30 из них подойдут, чтобы твой канал начал активно "
+                                                        "развиваться 📽\n\nДля анализа я взяла не только русских авторов, но и тех, кто создает видео на Английском языке\n\n*В таблице могут попадаться лишние темы, пока пропусти их, я активно работаю над этим🌟*\n\nЕсли у тебя "
+                                                        "есть вопросы по самому YouTube и ты хочешь получить максимум эффекта, напиши моему создателю @fabricbothelper")
+
+            print("аналитика пошла")
+            # await self.send_excel_file(update, context)
+        elif state == 'admin_send_excel_file':
+            print('zashli')
+            user_context = await self.get_user_context(chat_id)
+            print('тут', update.message)
+            if 'document' in update.message:
+                # Получаем объект файла
+                excel_file = update.message.document
+
+                # Получаем информацию о файле
+                file_name = excel_file.file_name
+                file_id = excel_file.file_id
+
+                print(user_context.admin_chat_id_of_user_for_send_file)
+
+                await context.bot.send_document(chat_id=user_context.admin_chat_id_of_user_for_send_file, document=excel_file)
+
+                # Скачиваем файл
+                # file_path = os.path.join('excel_files', file_name)
+                # await context.bot.get_file(file_id).download(file_path)
+
+                chat = await context.bot.get_chat(chat_id)
+
+                # Отвечаем пользователю о успешном сохранении файла
+                await update.message.reply_text(f"Файл '{file_name}' успешно отправлен пользователю {chat.id}.")
+            else:
+                # Если файл не был прикреплен, отвечаем пользователю об ошибке
+                await update.message.reply_text("Пожалуйста, пришлите файл Excel.")
+        elif state == 'admin_send_message_to_all_users':
+            await self.send_message_to_all_users(update, context, update.message.text)
 
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.callback_query.from_user.id
@@ -365,23 +638,69 @@ class ChatGPTTelegramBot:
             await self.congratulations_with_readiness(update, context)
         elif query.data == "create_new_video":
             await self.create_new_video(update, context)
+        elif query.data == "generate_video_ideas":
+            await self.generate_video_ideas(update, context)
+        elif query.data == "generate_shorts_ideas":
+            await self.generate_shorts_ideas(update, context)
         elif query.data == "create_new_shorts":
             await self.create_new_shorts(update, context)
         elif query.data == "info":
             await self.info(update, context)
         elif query.data == "account":
             await self.account(update, context)
-        # elif query.data == 'subscription_1_day':
-        #     payment_url = f"https://kirbudilovcoach.payform.ru/?do=pay&products"
-        # elif query.data == 'subscription_7_days':
-        #     payment_url = f"https://kirbudilovcoach.payform.ru/?order_id={user_id}&subscription=1779399&do=pay"
-        #     user_id = update.message.from_user.id
-        # elif query.data == 'subscription_30_days':
-        #     payment_url = f"https://kirbudilovcoach.payform.ru/?order_id={user_id}&subscription=1779400&do=pay"
+        elif query.data == "input_analytics":
+            await self.input_analytics(update, context)
+        elif query.data == 'input_links':
+            await self.input_links(update, context)
+        elif query.data == 'input_generate_analytics':
+            await self.input_generate_analytics(update, context)
+        elif query.data == "account":
+            await self.account(update, context)
+        elif query.data == 'input_links_change_text':
+            await self.input_links_change_text_handler(update, context)
+        elif query.data == 'input_links_generate_analytics':
+            await self.input_links_generate_analytics(update, context)
+        elif query.data == 'send_excel':
+            await self.send_excel(update, context)
+        elif query.data == 'send_message_to_all_users':
+            await self.send_message_to_all_users_get_text(update, context)
+
+    async def analytics(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="*Что такое аналитика конкурентов?*\n\n"
+                 "*Аналитика конкурентов* - это функция сбора данных об успешных видео, которые уже есть на YouTube в размере 100-500 видео за последнюю неделю, месяц и год\n"
+                 "Это, по сути, поиск идей для вашего канала - но основанный не на воображении, а на *статистике* и *цифрах*\n\n"
+                 "*Как это работает?*\n\n"
+                 "Вы рассказываете нам о своем канале — мы анализируем ваши данные, формируем представление о том, что представляет собой ваш проект, формируем портреты целевых зрителей, и получаем информацию о том, кто УЖЕ сейчас ваши конкуренты среди авторов контента и какие видео от них успешны.\n\n"
+                 "И собираем базу данных о выложенных видео из открытого доступа в 7-10-15 тысяч видео, а дальше по результатам и статистике этих видео фильтруем их до стадии, когда остаются лишь те идеи и ролики, которые уже «зашли», которые нравится людям 👍🏻\n\n"
+                 "*В итоге вы получаете таблицу, в которой можете отследить лучшие ролики конкурентов, которые подходят и вашему проекту / интересны вашим зрителям за неделю, месяц и год. Обычно их около 100-500 штук 🚀*\n\n"
+                 "Для чего это? Такая функция позволяет вам не исследовать весь ютюб и это очень важный шаг, чтобы изначально выбрать правильные идеи( ведь если чужие ролики набрали всего 10-20 тысяч просмотров по всему ютюбу, то на вряд ли видео от вас в той же теме соберет больше 30, даже если оно будет максимально качественным 🤝\n\n"
+                 "Успех видео зависит не столько от картинки, качеств, сколько от самой идеи видео - если люди его смотрят, значит, ютюб его продвигает. А значит, если мы Создадим видео изначально в той теме, которую люди смотрят - просмотры будут 📽️\n\n"
+                 "Поэтому вы можете за минимальную стоимость получить информацию, ценность которой колоссальна, ведь может приносить вам миллионы просмотров еще долгое время 💲\n\n"
+                 "*Вам необходимо будет лишь проанализировать этот список и выбрать, какие ролики вы можете повторить и адаптировать под себя.*\n\n"
+                 "А сценарии вы можете создать прямо здесь же 🎮",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+        keyboard = [
+            [InlineKeyboardButton("У меня есть канал", callback_data='input_links')],
+            [InlineKeyboardButton("Создаю новый", callback_data='input_analytics')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="У тебя уже есть канал или ты только его создаешь?",
+            reply_markup=reply_markup
+        )
 
     async def menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
+
         await update.message.reply_text(
-            "Добро пожаловать в главное меню! Я помогу тебе с созданием контента на YouTube и оптимизацией видео\n\nВот задачи, с которыми я могу помочь 👇  \n/naming - Упаковка канала \n/video - Создать сценарий видео \n/shorts - Создать сценарий shorts  \n/seo - Придумать название и описание к видео  \n/restart - Перезапуск бота \n\nВыбирай нужную функцию в меню выше"
+            "Добро пожаловать в главное меню! Я помогу тебе с созданием контента на YouTube и оптимизацией видео\n\nВот задачи, с которыми я могу помочь 👇  \n/naming - Упаковка канала \n/analytics - Получить аналитику канала \n/video - Создать сценарий видео \n/shorts - Создать сценарий shorts  \n/seo - Придумать название и описание к видео  \n/restart - Перезапуск бота \n\nВыбирай нужную функцию в меню выше"
         )
 
     async def couple_of_questions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -509,6 +828,8 @@ class ChatGPTTelegramBot:
         await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode='Markdown')
 
     async def naming(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
+
         user_id = update.message.from_user.id
         with Session() as session:
             user = session.query(User).filter(User.id == user_id).first()
@@ -527,39 +848,23 @@ class ChatGPTTelegramBot:
         self.user_states[update.effective_chat.id] = 'awaiting_channel_description'
 
     async def shorts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
+
         chat_id = update.message.chat_id
         user_id = update.message.from_user.id
 
-        # await update.message.reply_text(
-        #     "Приступим к созданию shorts!"
-        # )
-
-        # TODO: для всех обращений к локальному хранилищу, проверять БД + оптимизировать
         with Session() as session:
             user = session.query(User).filter(User.id == user_id).first()
-            # print(self.user_contexts[chat_id], self.user_contexts[chat_id]['_channel_description'])
-            if user and user.channel_description:
-                await update.message.reply_text(
-                    "Я вижу, что ты уже загружал описание канала! \n\nУ меня появились мысли о чем можно снять твои первые шортсы! Пойду пропишу сценарий, буду меньше, чем через минуту 😇"
-                )
-                feature = "shorts"
-                if not await self.check_and_handle_subscription_status(update, context, feature):
-                    return
-                shorts_query = f"Распиши 3 сценариев коротких видео по теме {user.channel_description} :: указав место съемки, раскадровку с числом секунд :: Полный текст, описание ролика с призывом к действию. Ответ должен быть на Русском языке."
-                shorts_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id,
-                                                                                           query=shorts_query)
 
-                keyboard = [
-                    [InlineKeyboardButton("Создать еще шортсы", callback_data='create_new_shorts')],
-                    [InlineKeyboardButton("Вернуться в меню", callback_data='view_features')]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=str(shorts_response),
-                    reply_markup=reply_markup,
-                    parse_mode='Markdown'
-                )
+            if user and user.channel_description:
+                reply_markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Давай посмотрим", callback_data='generate_shorts_ideas')],
+                    [InlineKeyboardButton("Создать новый shorts", callback_data='create_new_shorts')]
+                ])
+
+                await context.bot.send_message(chat_id=chat_id,
+                                               text="Я вижу, что ты уже загружал описание канала!\n\nУ меня появились мысли о чем можно снять твои первые шортсы!",
+                                               reply_markup=reply_markup)
                 return
             await update.message.reply_text(
                 "Приступим к созданию шортсов! Напиши мне в нескольких предложениях о чем хочешь рассказать людям и я придумаю тебе сценарий 🎥\n\nНачинай свое сообщение с \"О...\""
@@ -567,9 +872,34 @@ class ChatGPTTelegramBot:
 
             self.user_states[update.effective_chat.id] = 'create_new_shorts_handler'
 
+    async def generate_shorts_ideas(self, update: Update, context: CallbackContext):
+        chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat_id
+        user_id = update.callback_query.from_user.id
+        with Session() as session:
+            await update.callback_query.message.reply_text(
+                "Отлично! Скоро вернусь со сценариями!"
+            )
+            feature = "shorts"
+            if not await self.check_and_handle_subscription_status(update, context, feature):
+                return
+            user = session.query(User).filter(User.id == user_id).first()
+            shorts_query = f"Распиши 3 сценариев коротких видео по теме {user.channel_description} :: указав место съемки, раскадровку с числом секунд :: Полный текст, описание ролика с призывом к действию. Ответ должен быть на Русском языке. При создания сценария можно использовать один из методов по списку ниже: 1. Метод «скользкой горки» 2. Техника «шевеления занавеса» 3. Техника «Ложных следов» 4. Метод «Внутренний конфликт» 5. Техника «Крючок»"
+            shorts_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id,
+                                                                                       query=shorts_query)
+
+            keyboard = [
+                [InlineKeyboardButton("Создать еще шортсы", callback_data='create_new_shorts')],
+                [InlineKeyboardButton("Вернуться в меню", callback_data='view_features')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=str(shorts_response),
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+
     async def create_new_shorts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        print("ff")  # даже не вызывается
-        print(update, update.message)
         await update.callback_query.message.reply_text(
             "Приступим к созданию шортсов! Напиши мне в нескольких предложениях о чем хочешь рассказать людям и я придумаю тебе сценарий 🎥\n\nНачинай свое сообщение с \"О...\""
         )
@@ -582,7 +912,7 @@ class ChatGPTTelegramBot:
         feature = "shorts"
         if not await self.check_and_handle_subscription_status(update, context, feature):
             return
-        shorts_query = f"Распиши 3 сценариев коротких видео по теме {user_input} :: указав место съемки, раскадровку с числом секунд :: Полный текст, описание ролика с призывом к действию. Ответ должен быть на Русском языке."
+        shorts_query = f"Распиши 3 сценариев коротких видео по теме {user_input} :: указав место съемки, раскадровку с числом секунд :: Полный текст, описание ролика с призывом к действию. Ответ должен быть на Русском языке. При создания сценария можно использовать один из методов по списку ниже: 1. Метод «скользкой горки» 2. Техника «шевеления занавеса» 3. Техника «Ложных следов» 4. Метод «Внутренний конфликт» 5. Техника «Крючок»"
         shorts_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=shorts_query)
         keyboard = [
             [InlineKeyboardButton("Создать еще shorts", callback_data='create_new_shorts')],
@@ -597,19 +927,22 @@ class ChatGPTTelegramBot:
         )
 
     async def seo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
+
         await update.message.reply_text(
             "Отлично! Теперь пришли мне ссылку на видео, например, может загрузить его в доступ по ссылке на YouTube и отправить ее мне"
         )
 
         self.user_states[update.effective_chat.id] = 'waiting_for_seo'
 
-    async def get_subtitles(self, url):
+    def check_link(self, url):
         # Регулярные выражения для извлечения идентификатора видео из различных форматов URL YouTube
         regex_patterns = [
             r"(?:http[s]?://)?(?:www\.)?youtu\.be\/([a-zA-Z0-9_-]+)",  # Сокращённый URL
             r"(?:http[s]?://)?(?:www\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]+)",  # Стандартный URL с параметром v
             r"(?:http[s]?://)?(?:www\.)?youtube\.com/v/([a-zA-Z0-9_-]+)",  # URL с /v/
             r"(?:http[s]?://)?(?:www\.)?youtube\.com/embed/([a-zA-Z0-9_-]+)",  # URL встроенного видео
+            r"(?:http[s]?://)?(?:www\.)?youtube\.com/shorts/([a-zA-Z0-9_-]+)",  # URL встроенного видео
         ]
 
         video_id = None
@@ -620,7 +953,12 @@ class ChatGPTTelegramBot:
                 break
 
         if video_id is None:
-            raise ValueError("Некорректный URL. Пожалуйста, введи правильную ссылку на видео YouTube.")
+            raise ValueError(f"Некорректный URL: {url}. Пожалуйста, введи правильную ссылку на видео YouTube.")
+
+        return video_id
+
+    async def get_subtitles(self, url):
+        video_id = self.check_link(url)
 
         try:
             subtitles = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'en'])
@@ -648,10 +986,17 @@ class ChatGPTTelegramBot:
             )
             subtitles = await self.get_subtitles(user_input)
             print(subtitles)
-            # TODO: обработка битой ссылки
-            seo_query = f"Текст популярного видео: {subtitles[:25000]}. на основании представленного выше текста из видео сделай следующие шаги :: Создай seo оптимизацию для видео на YouTube по заданию ниже: Придумай название для видеоролика на YouTube. Количество слов в названии от 3 до 10. Предложи мне 5 идей :: Придумай описание к видео на ютюбу :: Описание должно состоять из 3 абзацев, первый должен отражать содержание и содержать ключевые слова для выдачи в поиске. Количество предложений от 10 до 15. Второй рассказывает про ролик и так же содержит ключевые слова для seo, количество предложений от 12 до 15. В третьем абзаце должно рассказывать о канале, количество предложений от 14 до 18. В конце описания должно быть 5 хэштегов по теме видео, каждый хэштег - 1 слово. В. Четвертом абзаце к описанию укажи ссылки на мои социальные сети Инстаграм - Телеграмм - :: Придумай 20 тегов к видео на YouTube и перечисли их через запятую :: Фразы могут содержать от 1 до 3 слов. Некоторые теги могут начинать со слова “как”, представь теги единым списком разделив их запятой. :: Также придумай на основе информации выше 10 идей концепции для превью картинок на видео на YouTube, какое должно быть фото на фоне, какого цвета фон, какие элементы расположить на картинке и какой должен быть указан текст. Ответ должен быть на русском языке и, если надо, то с использованием Markdown: вместо ### оборачивай ту часть сообщения, которую хочешь сделать жирным шрифтом, в ** перед началом предложения и ** в конце"
+
+            YANDEXGPT_TOKEN = os.environ['YANDEXGPT_TOKEN']
+
+            # seo_query = f"Текст популярного видео: {subtitles[:25000]}. на основании представленного выше текста из видео сделай следующие шаги :: Создай seo оптимизацию для видео на YouTube по заданию ниже: Придумай название для видеоролика на YouTube. Количество слов в названии от 3 до 10. Предложи мне 5 идей :: Придумай описание к видео на ютюбу :: Описание должно состоять из 3 абзацев, первый должен отражать содержание и содержать ключевые слова для выдачи в поиске. Количество предложений от 10 до 15. Второй рассказывает про ролик и так же содержит ключевые слова для seo, количество предложений от 12 до 15. В третьем абзаце должно рассказывать о канале, количество предложений от 14 до 18. В конце описания должно быть 5 хэштегов по теме видео, каждый хэштег - 1 слово. В. Четвертом абзаце к описанию укажи ссылки на мои социальные сети Инстаграм - Телеграмм - :: Придумай 20 тегов к видео на YouTube и перечисли их через запятую :: Фразы могут содержать от 1 до 3 слов. Некоторые теги могут начинать со слова “как”, представь теги единым списком разделив их запятой. :: Также придумай на основе информации выше 10 идей концепции для превью картинок на видео на YouTube, какое должно быть фото на фоне, какого цвета фон, какие элементы расположить на картинке и какой должен быть указан текст. Ответ должен быть на русском языке и, если надо, то с использованием Markdown: вместо ### оборачивай ту часть сообщения, которую хочешь сделать жирным шрифтом, в ** перед началом предложения и ** в конце"
+            seo_query = f"Текст популярного видео: {subtitles[:25000]}. на основании представленного выше текста из видео сделай следующие шаги :: Создай seo оптимизацию для видео на YouTube по заданию ниже: Придумай название для видеоролика на YouTube. Количество слов в названии от 3 до 10. Предложи мне 5 идей :: Придумай описание к видео на ютюбу :: Описание должно состоять из 3 абзацев, первый должен отражать содержание и содержать ключевые слова для выдачи в поиске. Количество предложений от 10 до 15. Второй рассказывает про ролик и так же содержит ключевые слова для seo, количество предложений от 12 до 15. В третьем абзаце должно рассказывать о канале, количество предложений от 14 до 18. В конце описания должно быть 5 хэштегов по теме видео, каждый хэштег - 1 слово. В. Четвертом абзаце к описанию укажи ссылки на мои социальные сети Инстаграм - Телеграмq :: Также придумай на основе информации выше 10 идей концепции для превью картинок на видео на YouTube, какое должно быть фото на фоне, какого цвета фон, какие элементы расположить на картинке и какой должен быть указан текст. Ответ должен быть на русском языке и, если надо, то с использованием Markdown: вместо ### оборачивай ту часть сообщения, которую хочешь сделать жирным шрифтом, в ** перед началом предложения и ** в конце"
 
             seo_response, seo_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=seo_query)
+
+            tags_query = f"Хорошо, теперь напиши к этому же видео теги. Важно учесть следующие правила: Теги - это те запросы, которые часто делают люди в интернете, которым может быть интересно это видео, поэтому нам нужно учитывать, как содержание видео, так и потенциальные интересы аудитории. Люди не гуглят «бизнес идеи», они обычно гуглят «как заработать денег», здесь же нам надо использовать этот принцип. То есть представь, что ты человек, у него есть проблем, ты делаешь запросы в интернете, и твоя задача - через них найти вот такое видео. Поэтому в тегах может содержаться как 1 слово, отражающее тему видео, так и серия из 2,3,4 слов. Тегов должно быть около 50 штук, присылай их в столбик без лишних комментариев, как минимум 10 штук из них должны являться запросами людей и начинаться со слова как."
+
+            tags_response, tags_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=tags_query)
 
             keyboard = [
                 [InlineKeyboardButton("Посмотреть функции", callback_data='view_features')],
@@ -662,6 +1007,12 @@ class ChatGPTTelegramBot:
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text=str(seo_response),
+                    parse_mode='Markdown'
+                )
+
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"Теги, которые можешь использовать:\n\n{str(tags_response)}",
                     reply_markup=reply_markup,
                     parse_mode='Markdown'
                 )
@@ -673,8 +1024,11 @@ class ChatGPTTelegramBot:
                         await context.bot.send_message(
                             chat_id=update.effective_chat.id,
                             text=str(seo_response),
+                        )
+                        await context.bot.send_message(
+                            chat_id=update.effective_chat.id,
+                            text=f"Здесь я предложу теги для тебя:\n\n{str(tags_response)}",
                             reply_markup=reply_markup,
-                            # Здесь не указываем parse_mode, чтобы отправить сообщение без форматирования
                         )
                     except Exception as e:
                         # Обработка других потенциальных ошибок при повторной попытке
@@ -690,40 +1044,23 @@ class ChatGPTTelegramBot:
             self.user_states[update.message.from_user.id] = "awaiting_correct_url"
 
     async def video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
+
         chat_id = update.message.chat_id
         user_id = update.message.from_user.id
-
-        await update.message.reply_text(
-            "Приступим к созданию видео!"
-        )
 
         with Session() as session:
             user = session.query(User).filter(User.id == user_id).first()
 
-            # TODO: добавить возможность создавать новые видео
-            # TODO: добавить поддержку ответа (response) в несколько сообщений (когда ответы большие)
             if user and user.channel_description:
-                feature = "video"
-                if not await self.check_and_handle_subscription_status(update, context, feature):
-                    return
-                await update.message.reply_text(
-                    "Я вижу, что ты уже загружал описание канала!\n\nУ меня появились мысли о чем можно снять твое первое видео! Пойду пропишу сценарий, буду меньше, чем через минуту 😇"
-                )
-                video_query = f"Распиши сценарий видео на 5-10 минут по теме {user.channel_description} :: указав место съемки, подробную раскадровку с числом секунд, внешний вид автора :: Напиши полный текст, по каждому промежутку раскадровки, который произнесет автор, с завершением ролика призывом к действию :: А после укажи рекомендации, на что обратить внимание при съемке. Ответ должен быть на Русском языке."
-                video_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id,
-                                                                                          query=video_query)
+                reply_markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Давай посмотрим", callback_data='generate_video_ideas')],
+                    [InlineKeyboardButton("Создать новое видео", callback_data='create_new_video')]
+                ])
 
-                keyboard = [
-                    [InlineKeyboardButton("Создать еще видео", callback_data='create_new_video')],
-                    [InlineKeyboardButton("Вернуться в меню", callback_data='view_features')]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=str(video_response),
-                    reply_markup=reply_markup,
-                    parse_mode='Markdown'
-                )
+                await context.bot.send_message(chat_id=chat_id,
+                                               text="Я вижу, что ты уже загружал описание канала!\n\nУ меня появились мысли о чем можно снять твое первое видео!",
+                                               reply_markup=reply_markup)
                 return
 
             await update.message.reply_text(
@@ -731,6 +1068,33 @@ class ChatGPTTelegramBot:
             )
 
             self.user_states[update.effective_chat.id] = 'create_new_video_handler'
+
+    async def generate_video_ideas(self, update: Update, context: CallbackContext):
+        chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat_id
+        user_id = update.callback_query.from_user.id
+        with Session() as session:
+            await update.callback_query.message.reply_text(
+                "Отлично! Скоро вернусь со сценарием!"
+            )
+            feature = "video"
+            if not await self.check_and_handle_subscription_status(update, context, feature):
+                return
+            user = session.query(User).filter(User.id == user_id).first()
+            video_query = f"Распиши сценарий видео на 5-10 минут по теме {user.channel_description} :: указав место съемки, подробную раскадровку с числом секунд, внешний вид автора :: Напиши полный текст, по каждому промежутку раскадровки, который произнесет автор, с завершением ролика призывом к действию :: А после укажи рекомендации, на что обратить внимание при съемке. Ответ должен быть на Русском языке. При создания сценария можно использовать один из методов по списку ниже: 1. Метод «скользкой горки» 2. Техника «шевеления занавеса» 3. Техника «Ложных следов» 4. Метод «Внутренний конфликт» 5. Техника «Крючок»"
+            video_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id,
+                                                                                      query=video_query)
+
+            keyboard = [
+                [InlineKeyboardButton("Создать еще видео", callback_data='create_new_video')],
+                [InlineKeyboardButton("Вернуться в меню", callback_data='view_features')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=str(video_response),
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
 
     # TODO: поощрать пользователей
     async def create_new_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -750,7 +1114,7 @@ class ChatGPTTelegramBot:
         await update.message.reply_text(
             "Отлично! Ушла писать сценарий! 😇"
         )
-        video_query = f"Распиши сценарий видео на 5-10 минут по теме {user_input} :: указав место съемки, подробную раскадровку с числом секунд, внешний вид автора :: Напиши полный текст, по каждому промежутку раскадровки, который произнесет автор, с завершением ролика призывом к действию :: А после укажи рекомендации, на что обратить внимание при съемке. Ответ должен быть на Русском языке."
+        video_query = f"Распиши сценарий видео на 5-10 минут по теме {user_input} :: указав место съемки, подробную раскадровку с числом секунд, внешний вид автора :: Напиши полный текст, по каждому промежутку раскадровки, который произнесет автор, с завершением ролика призывом к действию :: А после укажи рекомендации, на что обратить внимание при съемке. Ответ должен быть на Русском языке. При создания сценария можно использовать один из методов по списку ниже: 1. Метод «скользкой горки» 2. Техника «шевеления занавеса» 3. Техника «Ложных следов» 4. Метод «Внутренний конфликт» 5. Техника «Крючок»"
         video_response, shorts_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=video_query)
         await update.message.reply_text(
             "Вот твой ответ!"
@@ -767,18 +1131,568 @@ class ChatGPTTelegramBot:
             parse_mode='Markdown'
         )
 
+    async def input_analytics(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        feature = "analytics_attempts"
+        if not await self.check_and_handle_subscription_status(update, context, feature):
+            return
+        await update.callback_query.message.reply_text(
+            "Приступим к созданию аналитики! Расскажи о чем твой канал?"
+        )
+
+        self.user_states[update.effective_chat.id] = 'input_analytics_channel_description_handler'
+
+    async def input_analytics_channel_audience(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "Расскажи какая аудитория у твоего канала?"
+        )
+
+        self.user_states[update.effective_chat.id] = 'input_analytics_channel_audience_handler'
+
+    async def input_analytics_channel_goals(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "Какие 3 ключевых цели канала?"
+        )
+
+        self.user_states[update.effective_chat.id] = 'input_analytics_channel_goals_handler'
+
+    async def input_analytics_last_step(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.message.chat_id
+        user_id = update.message.from_user.id
+
+        keyboard = [
+            [InlineKeyboardButton("Все верно", callback_data='input_generate_analytics')],
+            [InlineKeyboardButton("Изменить переменные", callback_data='input_analytics')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        with Session() as session:
+            user = session.query(User).filter(User.id == user_id).first()
+
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Правильно ли я поняла, что ваш задачу можно описать так:\n\n"
+                     f"{user.analytics_channel_description}\n\n"
+                     f"Аудитория: {user.analytics_channel_audience}\n\n"
+                     f"Ключевые цели канала: {user.analytics_channel_goals}",
+                reply_markup=reply_markup,
+            )
+
+    async def send_notification_to_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE, message):
+        print("Тут ошибка")
+        chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat_id
+
+        for admin_chat_id in ADMINS_CHAT_ID:
+            await context.bot.send_message(
+                chat_id=admin_chat_id,
+                text=f"Пользователю ({update.effective_chat.id}, {chat_id}) нужен анализ с такими ключевыми словами:\n\n{message}"
+            )
+            await context.bot.send_message(
+                chat_id=admin_chat_id,
+                text=f"Создай задачу в Octoparse, скопируй и введи сюда task_id:"
+            )
+            self.user_states[update.effective_chat.id] = 'admin_input_task_id'
+
+    async def send_excel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        keyboard = [
+            [InlineKeyboardButton("Назад", callback_data='admin')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Введите chat_id пользователя, которому собираетесь отправить файл",
+            reply_markup=reply_markup,
+        )
+
+        self.user_states[update.effective_chat.id] = 'admin_send_excel_user'
+
+    async def send_excel_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Загрузите файл, который необходимо отправить",
+        )
+        self.user_states[update.effective_chat.id] = 'admin_send_excel_file'
+
+    async def send_excel_file_to_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        print('zashli')
+        user_context = await self.get_user_context(chat_id)
+        print('тут', update.message)
+        if 'document' in update.message:
+            # Получаем объект файла
+            excel_file = update.message.document
+
+            # Получаем информацию о файле
+            file_name = excel_file.file_name
+            file_id = excel_file.file_id
+
+            print(user_context.admin_chat_id_of_user_for_send_file)
+
+            await context.bot.send_document(chat_id=user_context.admin_chat_id_of_user_for_send_file,
+                                            document=excel_file)
+
+            # Скачиваем файл
+            # file_path = os.path.join('excel_files', file_name)
+            # await context.bot.get_file(file_id).download(file_path)
+
+            chat = await context.bot.get_chat(chat_id)
+
+            # Отвечаем пользователю о успешном сохранении файла
+            await update.message.reply_text(f"Файл '{file_name}' успешно отправлен пользователю {chat.id}.")
+        else:
+            # Если файл не был прикреплен, отвечаем пользователю об ошибке
+            await update.message.reply_text("Пожалуйста, пришлите файл Excel.")
+
+    async def send_message_to_all_users_get_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Введите сообщение, которое собираетесь отправить всем пользователям",
+        )
+
+        self.user_states[update.effective_chat.id] = 'admin_send_message_to_all_users'
+
+    async def send_message_to_all_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text):
+        try:
+            # Получаем количество участников текущего чата
+            chat_id = update.effective_chat.id
+            # chat_members_count = await context.bot.get_chat_members_count(chat_id)
+
+            # Получаем список всех пользователей из базы данных
+            with Session() as session:
+                all_users = session.query(User).all()
+
+            # Проходимся по каждому пользователю и отправляем сообщение
+            print(all_users)
+            for user in all_users:
+                await context.bot.send_message(chat_id=user.id, text=text)
+
+            # Проходимся по каждому участнику и отправляем сообщение
+
+            # for offset in users_id:
+            #     member = await context.bot.get_chat_member(chat_id, offset)
+            #     print(member.user.id)
+            # print(str(await context.bot.get_updates()))
+            # print(list(await context.bot.get_updates()))
+            # all_chat_ids = []
+            # async for update in context.bot.get_updates():
+            #     all_chat_ids.append(update.message.chat_id)
+            # print(all_chat_ids)
+            # all_chat_ids = [update.message.chat_id for update in bot.get_updates()]
+
+            # all_chat_members = context.bot.get_chat_members_count(update.effective_chat.id)
+            # async for update in context.bot.get_updates():
+            #     all_chat_ids.append(update.effective_chat.id)
+            # for member in all_chat_members:
+                # Отправляем сообщение в каждый чат
+                # print(member.user.id, text)
+                # await context.bot.send_message(
+                #     chat_id=chat_id,
+                #     text=text,
+                # )
+        except TelegramError as e:
+            logger.error(f"An error occurred while sending messages: {e}")
+            print(e)
+
+    async def admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        print(update.message.chat_id)
+        keyboard = [
+            [InlineKeyboardButton("Отправить excel файл пользователю", callback_data='send_excel')],
+            [InlineKeyboardButton("Загрузить id таски Octoparse и отправить пользователю", callback_data='input_analytics')],
+            [InlineKeyboardButton("Посмотреть данные о пользователе", callback_data='input_analytics')],
+            [InlineKeyboardButton("Получить ID пользователя", callback_data='input_analytics')],
+            [InlineKeyboardButton("Получить CHAT_ID пользователя", callback_data='input_analytics')],
+            [InlineKeyboardButton("Отправить сообщение всем пользователям", callback_data='send_message_to_all_users')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Админ панель. Если загрузить id таски Octoparse, файл вышлется сразу после того как выполнится задача",
+            reply_markup=reply_markup,
+        )
+
+    async def test_send_notification_to_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Введи через запятую таску и чат id пользователя."
+        )
+        # print(update.effective_chat.id)
+        # await context.bot.send_message(
+        #     chat_id=update.effective_chat.id,
+        #     text=f"Спасибо Кирюха или Мишаня! Получил ваш chat_id, теперь добавлю в админку)))"
+        # )
+        # for admin_chat_id in ADMINS_CHAT_ID:
+            # await context.bot.send_message(
+            #     chat_id=admin_chat_id,
+            #     text=f"Пользователю нужен анализ с такими ключевыми словами:"
+            # )
+            # await context.bot.send_message(
+            #     chat_id=admin_chat_id,
+            #     text=f"Создай задачу в Octoparse, скопируй и введи сюда task_id, а через запятую chat_id клиента"
+            # )
+        self.user_states[update.effective_chat.id] = 'admin_input_task_id_test'
+
+    async def input_generate_analytics(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat_id
+        user_id = update.callback_query.from_user.id
+        user_context = await self.get_user_context(chat_id)
+
+        print(chat_id, user_id)
+
+        keyboard = [
+            [InlineKeyboardButton("Вернуться в меню", callback_data='view_features')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Отлично, вся информация у меня уже есть, процесс аналитики занимает несколько часов. \n\nУже скоро я вернусь и вы получите 👇🏻\nТаблицу в формате «xslx» с результатами, не выключайте уведомления 🚀\n\nМожешь пока ознакомиться с другими возможностями бота",
+            reply_markup=reply_markup,
+        )
+
+        with Session() as session:
+            # feature = "analytics_attempts"
+            # if not await self.check_and_handle_subscription_status(update, context, feature):
+            #     return
+            user = session.query(User).filter(User.id == user_id).first()
+            analytics_words_1_query = f"Cейчас я отправлю тебе определённый набор информации о моем канале на YouTube и по нему нам нужно будет выполнить серию заданий. {user.analytics_channel_description}. {user.analytics_channel_audience}. {user.analytics_channel_goals} Для начала - мне важно понять к каким категориям контента можно вообще отнести мой канал  - какие это ниши? какие есть конкуренты в этой теме? с кем мне нужно будет конкурировать за просмотры."
+            analytics_words_1_query_response, analytics_words_1_query_total_tokens = await self.openai.get_chat_response(
+                chat_id=chat_id, query=analytics_words_1_query)
+
+            analytics_words_2_query = f"{analytics_words_1_query_response}. На основе того что мы разработали выше - помоги мне составить портрет целевого зрителя - я и его интересы - какие у него потребности и желания что ему хочется иметь в своей жизни какой контент он любит смотреть и вообще как нам сделать так чтобы зрители смотрели наши видео а не видео конкурентов"
+            analytics_words_2_query_response, analytics_words_2_query_total_tokens = await self.openai.get_chat_response(
+                chat_id=chat_id, query=analytics_words_2_query)
+
+            analytics_words_3_query = f"{analytics_words_2_query_response}. Хорошо теперь на основе всех данных мне необходимо подготовить 100 ключевых слов которые могут содержаться в названиях видео конкурентов - важно чтобы это были не просто слова по тематике а конкретные слова которые есть в названиях тех видео которое может интересно описанному выше целевому зрителю"
+            analytics_words_3_query_response, analytics_words_3_query_total_tokens = await self.openai.get_chat_response(
+                chat_id=chat_id, query=analytics_words_3_query)
+
+            analytics_words_4_query = f"{analytics_words_3_query_response}. Теперь давай выберем из них 15 самых приоритетных и лучших - я буду загружать эти слова в парсер - поэтому каждый пункт это только 1 слово и важно чтобы оно было максимально простым и отражало суть чтобы собрать лучшие видео со всего ютюба и переведи эти слова на английский - в итоге в списке должно получить 30 слов (15 рус и 15 англ). Напиши только список слов, каждое слово с новой строки, без воды, только список из 30 слов."
+            analytics_words_4_query_response, analytics_words_4_query_total_tokens = await self.openai.get_chat_response(
+                chat_id=chat_id, query=analytics_words_4_query)
+
+            user_context.save_analytics_words(user_id, analytics_words_4_query_response)
+
+            await self.send_notification_to_admin(update, context, analytics_words_4_query_response)
+
+            # await asyncio.sleep(5)
+            #
+            # await update.effective_message.chat.send_action(constants.ChatAction.UPLOAD_DOCUMENT)
+            #
+            # file_path = 'Аналитика.xlsx'
+            # # os.path.basename(file_path)
+            #
+            # with open(file_path, 'rb') as file:
+            #     await context.bot.send_document(chat_id=update.effective_chat.id, document=file,
+            #                                     filename='Аналитика.xlsx',
+            #                                     caption="Я провела аналитику, ниже отправила тебе файл 🙏🏻\n\nКак им пользоваться? \n\nВ этой таблице ролики твоих конкурентов, отсортированные из объема в 7-10 тысяч, по определенным критериям таким как просмотры, "
+            #                                             "дата публикации и т.д.\n\nВсего есть 3 параметра - лучшие видео за последнюю неделю, месяц и год \n\nТы можешь изучить этот контент и снять видео на похожие темы, либо даже полностью повторить их, все они — трендовые, "
+            #                                             "ибо собрали большие просмотры за короткий промежуток времени\n\nПроще говоря, из 7000 видео, которые уже сняли твои конкуренты, я выбрала 100-200 штук, уверена, больше 30 из них подойдут, чтобы твой канал начал активно "
+            #                                             "развиваться 📽\n\nДля анализа я взяла не только русских авторов, но и тех, кто создает видео на Английском языке\n\n*В таблице могут попадаться лишние темы, пока пропусти их, я активно работаю над этим🌟*\n\nЕсли у тебя "
+            #                                             "есть вопросы по самому YouTube и ты хочешь получить максимум эффекта, напиши моему создателю @fabricbothelper")
+            #
+            # print("аналитика пошла")
+
+    async def input_links(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        feature = "analytics_attempts"
+        if not await self.check_and_handle_subscription_status(update, context, feature):
+            return
+        await update.callback_query.message.reply_text(
+            "Приступим к созданию аналитики! Предоставь мне ссылки на существующие ролики (до 5 шт.). Каждая ссылка должна быть с новой строки"
+        )
+
+        self.user_states[update.effective_chat.id] = 'input_links_handler'
+
+    async def input_links_change_text_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.callback_query.message.reply_text(
+            "Пришли исправленную версию текста"
+        )
+
+        self.user_states[update.effective_chat.id] = 'input_links_change_text_correct'
+
+    async def input_links_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE, links):
+        chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat_id
+        user_id = update.message.from_user.id
+        user_context = await self.get_user_context(chat_id)
+
+        # try:
+        links = links.split('\n')
+        print("AAALLLOOO")
+        print(links)
+
+        try:
+            video_ids = []
+            for link in links:
+                video_ids.append(self.check_link(link))
+            if len(video_ids) > 5:
+                await context.bot.send_message(chat_id=chat_id,
+                                               text=f"Можно отправить только 5 видео. Пожалуйста, повтори попытку")
+                self.user_states[update.message.from_user.id] = "input_links_handler"
+                return
+            user_context.save_analytics_links(user_id, links)
+
+            all_subtitles = []
+
+            all_generates_by_subtitles = []
+
+            print(video_ids)
+
+            print("wtf")
+
+            try:
+                await update.message.reply_text(
+                    "Отлично! Ушла разрабатывать аналитику! 😇"
+                )
+                for link in links:
+                    subtitles = await self.get_subtitles(link)
+                    print(subtitles)
+                    all_subtitles.append(subtitles[:25000])
+
+                    subtitles_query = f"У меня есть субтитры к видео - напиши по ним краткое содержание в 3-4 предложения. И ничего более. СУБТИТРЫ: {subtitles[:25000]}"
+
+                    subtitles_response, subtitles_total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=subtitles_query)
+
+                    all_generates_by_subtitles.append(subtitles_response)
+
+                subtitles_end_query = f"У меня есть 5 кратких содержаний с ютуб канала. СОДЕРЖАНИЯ: {', СЛЕДУЮЩЕЕ СОДЕРЖАНИЕ: '.join(all_generates_by_subtitles)}. На основе этих данных мне необходимо заполнить 3 вопроса: Первый - Расскажите о чем канал (Вставь ответ содержащий 7 предложений начиная с «канал о…». Второй - Расскажите о своей аудитории (Вставь ответ содержащий информацию об аудитории такого канала - ее интересах и потребностях в 7 предложений). Выбери 3 категории из 6-и возможных - это категории «задачи канал» то есть то что важно для автора на основе этой информации. Категории следующие: Набор подписчиков, Повышение узнаваемости, Информирование людей, Получение клиентов, Личная реализация. Представь ответ в формате 3 пунктов по заданию выше. В выдаче должны быть только ответы, три абзаца."
+
+                subtitles_end_query_response, subtitles_end_query_total_tokens = await self.openai.get_chat_response(chat_id=chat_id,
+                                                                                                 query=subtitles_end_query)
+
+                user_context.save_analytics_channel_characteristics(user_id, subtitles_end_query_response)
+
+                keyboard = [
+                    [InlineKeyboardButton("Изменить текст", callback_data='input_links_change_text')],
+                    [InlineKeyboardButton("Начать генерацию аналитики", callback_data='input_links_generate_analytics')]
+                ]
+
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"Снизу дана характеристика твоего канала. Убедить, что она исправная. \n\n{subtitles_end_query_response}",
+                    reply_markup=reply_markup,
+                )
+            except ValueError as e:
+                print(e)
+                await context.bot.send_message(chat_id=chat_id, text=str(e))
+                self.user_states[update.message.from_user.id] = "input_links_handler"
+
+            # keyboard = [
+            #     [InlineKeyboardButton("Вернуться в меню", callback_data='view_features')]
+            # ]
+            # reply_markup = InlineKeyboardMarkup(keyboard)
+            # await context.bot.send_message(
+            #     chat_id=update.effective_chat.id,
+            #     text="Отлично, вся информация у меня уже есть, процесс аналитики занимает несколько часов. \n\nУже скоро я вернусь и вы получите 👇🏻\nТаблицу в формате «xslx» с результатами, не выключайте уведомления 🚀\n\nМожешь пока ознакомиться с другими возможностями бота",
+            #     reply_markup=reply_markup,
+            # )
+            #
+            # print('wtf2')
+            #
+            # await asyncio.sleep(5)
+            #
+            # await update.effective_message.chat.send_action(constants.ChatAction.UPLOAD_DOCUMENT)
+            #
+            # file_path = 'Аналитика.xlsx'
+            # # os.path.basename(file_path)
+            #
+            # with open(file_path, 'rb') as file:
+            #     await context.bot.send_document(chat_id=update.effective_chat.id, document=file,
+            #                                     filename='Аналитика.xlsx',
+            #                                     caption="Я провела аналитику, ниже отправила тебе файл 🙏🏻\n\nКак им пользоваться? \n\nВ этой таблице ролики твоих конкурентов, отсортированные из объема в 7-10 тысяч, по определенным критериям таким как просмотры, "
+            #                                             "дата публикации и т.д.\n\nВсего есть 3 параметра - лучшие видео за последнюю неделю, месяц и год \n\nТы можешь изучить этот контент и снять видео на похожие темы, либо даже полностью повторить их, все они — трендовые, "
+            #                                             "ибо собрали большие просмотры за короткий промежуток времени\n\nПроще говоря, из 7000 видео, которые уже сняли твои конкуренты, я выбрала 100-200 штук, уверена, больше 30 из них подойдут, чтобы твой канал начал активно "
+            #                                             "развиваться 📽\n\nДля анализа я взяла не только русских авторов, но и тех, кто создает видео на Английском языке\n\n*В таблице могут попадаться лишние темы, пока пропусти их, я активно работаю над этим🌟*\n\nЕсли у тебя "
+            #                                             "есть вопросы по самому YouTube и ты хочешь получить максимум эффекта, напиши моему создателю @fabricbothelper")
+
+        except ValueError as e:
+            await context.bot.send_message(chat_id=chat_id,
+                                           text=f"Кажется, чтот-то пошло не так, попробуй еще раз. Предоставь мне ссылки на существующие ролики (до 5 шт.). Каждая ссылка должна быть с новой строки\n\n{e}")
+            self.user_states[update.message.from_user.id] = "input_links_handler"
+
+    async def input_links_generate_analytics(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.callback_query.from_user.id
+        chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat_id
+        print("Chat id:", chat_id)
+        user_context = await self.get_user_context(chat_id)
+        with Session() as session:
+            feature = "analytics_attempts"
+            if not await self.check_and_handle_subscription_status(update, context, feature):
+                return
+            user = session.query(User).filter(User.id == user_id).first()
+
+            keyboard = [
+                [InlineKeyboardButton("Вернуться в меню", callback_data='view_features')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Отлично, вся информация у меня уже есть, процесс аналитики занимает несколько часов. \n\nУже скоро я вернусь и вы получите 👇🏻\nТаблицу в формате «xslx» с результатами, не выключайте уведомления 🚀\n\nМожешь пока ознакомиться с другими возможностями бота",
+                reply_markup=reply_markup,
+            )
+
+            print("Chat id:", chat_id)
+
+            analytics_words_1_query = f"Cейчас я отправлю тебе определённый набор информации о моем канале на YouTube и по нему нам нужно будет выполнить серию заданий. {user.analytics_channel_characteristics} Для начала - мне важно понять к каким категориям контента можно вообще отнести мой канал  - какие это ниши? какие есть конкуренты в этой теме? с кем мне нужно будет конкурировать за просмотры."
+            analytics_words_1_query_response, analytics_words_1_query_total_tokens = await self.openai.get_chat_response(
+                chat_id=chat_id, query=analytics_words_1_query)
+
+            analytics_words_2_query = f"{analytics_words_1_query_response}. На основе того что мы разработали выше - помоги мне составить портрет целевого зрителя - я и его интересы - какие у него потребности и желания что ему хочется иметь в своей жизни какой контент он любит смотреть и вообще как нам сделать так чтобы зрители смотрели наши видео а не видео конкурентов"
+            analytics_words_2_query_response, analytics_words_2_query_total_tokens = await self.openai.get_chat_response(
+                chat_id=chat_id, query=analytics_words_2_query)
+
+            analytics_words_3_query = f"{analytics_words_2_query_response}. Хорошо теперь на основе всех данных мне необходимо подготовить 100 ключевых слов которые могут содержаться в названиях видео конкурентов - важно чтобы это были не просто слова по тематике а конкретные слова которые есть в названиях тех видео которое может интересно описанному выше целевому зрителю"
+            analytics_words_3_query_response, analytics_words_3_query_total_tokens = await self.openai.get_chat_response(
+                chat_id=chat_id, query=analytics_words_3_query)
+
+            analytics_words_4_query = f"{analytics_words_3_query_response}. Теперь давай выберем из них 15 самых приоритетных и лучших - я буду загружать эти слова в парсер - поэтому каждый пункт это только 1 слово и важно чтобы оно было максимально простым и отражало суть чтобы собрать лучшие видео со всего ютюба и переведи эти слова на английский - в итоге в списке должно получить 30 слов (15 рус и 15 англ). Напиши только список слов, каждое слово с новой строки, без воды, только список из 30 слов."
+            analytics_words_4_query_response, analytics_words_4_query_total_tokens = await self.openai.get_chat_response(
+                chat_id=chat_id, query=analytics_words_4_query)
+
+            print("Chat id:", chat_id)
+
+            user_context.save_analytics_words(user_id, analytics_words_4_query_response)
+
+            await self.send_notification_to_admin(update, context, analytics_words_4_query_response)
+
+    async def monitor_task_and_get_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE, task_id):
+        octoparse = Octoparse()
+        print("пошел мониторинг")
+        while True:
+            status = octoparse.is_task_running(task_id=task_id)
+
+            # если задача выполнена, выходим из цикла
+            if not status:
+                break
+
+            # ожидаем некоторое время перед повторной проверкой
+            print("прошло 30 секунд")
+            await asyncio.sleep(30)  # например, каждые 30 секунд
+
+        # если status стал False, продолжаем выполнение кода
+        print('получение данных')
+        data = octoparse.get_task_data(task_id=task_id)
+
+        cleaned_data = []
+        for item in data:
+            item["Video_Title"] = item["Video_Title"].strip()
+            cleaned_data.append(item)
+
+        # print(data)
+        print("данные получены")
+        try:
+
+            # Открыть файл и загрузить данные
+            print("Открыть файл и загрузить данные")
+
+            json_data = json.dumps(cleaned_data, ensure_ascii=False)
+
+            with open(f'analytics_data/data_{task_id}.json', 'w', encoding='utf-8') as f:
+                f.write(json_data)
+                print("Данные успешно сохранены в JSON файл")
+                print("данные отправились в парсер")
+                result_output_file_path = await parser(f'analytics_data/data_{task_id}.json')
+                print("данные вернулись из парсера и отправляются пользователю")
+                await update.effective_message.chat.send_action(constants.ChatAction.UPLOAD_DOCUMENT)
+
+                # os.path.basename(file_path)
+                print(result_output_file_path, "ВОТ ЗДЕСЬ ПРОБЛЕМА?")
+                with open(result_output_file_path, 'rb') as file:
+                    await context.bot.send_document(chat_id=update.effective_chat.id, document=file,
+                                                    filename=f'{result_output_file_path}',
+                                                    caption="Я провела аналитику, ниже отправила тебе файл 🙏🏻\n\nКак им пользоваться? \n\nВ этой таблице ролики твоих конкурентов, отсортированные из объема в 7-10 тысяч, по определенным критериям таким как просмотры, "
+                                                            "дата публикации и т.д.\n\nВсего есть 3 параметра - лучшие видео за последнюю неделю, месяц и год \n\nТы можешь изучить этот контент и снять видео на похожие темы, либо даже полностью повторить их, все они — трендовые, "
+                                                            "ибо собрали большие просмотры за короткий промежуток времени\n\nПроще говоря, из 7000 видео, которые уже сняли твои конкуренты, я выбрала 100-200 штук, уверена, больше 30 из них подойдут, чтобы твой канал начал активно "
+                                                            "развиваться 📽\n\nДля анализа я взяла не только русских авторов, но и тех, кто создает видео на Английском языке\n\n*В таблице могут попадаться лишние темы, пока пропусти их, я активно работаю над этим🌟*\n\nЕсли у тебя "
+                                                            "есть вопросы по самому YouTube и ты хочешь получить максимум эффекта, напиши моему создателю @fabricbothelper")
+
+                for chat_admin_id in ADMINS_CHAT_ID:
+                    with open(result_output_file_path, 'rb') as file:
+                        await context.bot.send_document(chat_id=chat_admin_id, document=file,
+                                                        filename=f'{result_output_file_path}',
+                                                        caption="Я провела аналитику, ниже отправила тебе файл 🙏🏻\n\nКак им пользоваться? \n\nВ этой таблице ролики твоих конкурентов, отсортированные из объема в 7-10 тысяч, по определенным критериям таким как просмотры, "
+                                                                "дата публикации и т.д.\n\nВсего есть 3 параметра - лучшие видео за последнюю неделю, месяц и год \n\nТы можешь изучить этот контент и снять видео на похожие темы, либо даже полностью повторить их, все они — трендовые, "
+                                                                "ибо собрали большие просмотры за короткий промежуток времени\n\nПроще говоря, из 7000 видео, которые уже сняли твои конкуренты, я выбрала 100-200 штук, уверена, больше 30 из них подойдут, чтобы твой канал начал активно "
+                                                                "развиваться 📽\n\nДля анализа я взяла не только русских авторов, но и тех, кто создает видео на Английском языке\n\n*В таблице могут попадаться лишние темы, пока пропусти их, я активно работаю над этим🌟*\n\nЕсли у тебя "
+                                                                "есть вопросы по самому YouTube и ты хочешь получить максимум эффекта, напиши моему создателю @fabricbothelper")
+        except Exception as e:
+            print(f"Ошибка при сохранении данных в JSON файл: {e}")
+
     async def support(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
+
         keyboard = [
             [InlineKeyboardButton("Написать", url='https://t.me/fabricbothelper')],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="[В разработке]\n\nДля того, чтобы связаться с поддержкой, нажмите по кнопке ниже 🎥",
+            text="Для того, чтобы связаться с поддержкой, нажмите по кнопке ниже 🎥",
             reply_markup=reply_markup
         )
 
+    async def faq(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
+        chat_id = update.effective_chat.id
+        prompt = """
+            Привет, этот контекст будет интегрирован в чат-бота и ты будешь выполнять роль консультанта, то есть являешься помощником по раздел FAQ 
+            Ниже информация о проекте, которую тебе нужно знать, чтобы отвечать на вопросы клиента 
+            Бот представляет собой сервис, помогающий в создании контента на YouTube, он полезен авторам каналов, агентствам, продюсерам и ассистентам
+            Она умеет анализировать видео конкурентов, помогает с сео оптимизацией роликов и дает идеи для сценариев 
+            Основные кнопки (функции) в боте следубщие👇🏻
+            /info - здесь хранится информация о сервисе, тарифах, особенностях работы и нужные инструкции 
+            /menu - это кнопка, вызывающая главное меню, в котором можно активировать различные функции 
+            /account - эта кнопка вызывает меню личного кабинета, где вы можете найти информацию о подписке и статусе аккаунта 
+            /analytics - это функция, вызывающая возможность получить общую аналитику по видеороликам в вашей нише среди других авторов 
+            Аналитика конкурентов - это функция сбора данных об успешных видео, которые уже есть на YouTube в размере 100-500 видео за последнюю неделю, месяц и год  
+            Это, по сути, поиск идей для вашего канала - но основанный не на воображении, а на статистике и цифрах 
+            Как это работает? 
+            Вы рассказываете нам о своем канале — мы анализируем ваши данные, формируем представление о том, что представляет собой ваш проект, формируем портреты целевых зрителей, и получаем информацию о том, кто УЖЕ сейчас ваши конкуренты среди авторов контента и какие видео от них успешны.
+            И собираем базу данных о выложенных видео из открытого доступа в 7-10-15 тысяч видео, а дальше по результатам и статистике этих видео фильтруем их до стадии, когда остаются лишь те идеи и ролики, которые уже «зашли», которые нравится людям 👍🏻
+            В итоге вы получаете таблицу в формате xslx, в которой можете отследить лучшие ролики конкурентов, которые подходят и вашему проекту / интересны вашим зрителям за неделю, месяц и год. Обычно их около 100-500 штук 🚀
+            Для чего это? Такая функция позволяет вам не исследовать весь ютюб и это очень важный шаг, чтобы изначально выбрать правильные идеи( ведь если чужие ролики набрали всего 10-20 тысяч просмотров по всему ютюбу, то на вряд ли видео от вас в той же теме соберет больше 30, даже если оно будет максимально качественным 🤝
+            Успех видео зависит не столько от картинки, качеств, сколько от самой идеи видео - если люди его смотрят, значит, ютюб его продвигает. А значит, если мы Создадим видео изначально в той теме, которую люди смотрят - просмотры будут 📽️
+            Вам необходимо будет лишь проанализировать этот список и выбрать, какие ролики вы можете повторить и адаптировать под себя. 
+            Для получения аналитики пользователю нужно выбрать 2 пути - либо отправить информацию о канале и рассказать подробно про проект, либо отправить ссылки на 5 видео, наиболее полно отражающие тематику канала 
+            Важно быть внимательным в этом процессе, чтобы получить максимально качес
+            Аналитика занимает от 2 до 4 часов, поскольку обрабатывается большой объем информации и отправляется с 10:00 до 22:00. Если в течение 12 часов вы не получили ответ, обратитесь в службу поддержку  
+            /naming - это функция помогает придумать название и описание к каналу, предлагает список идей  
+            /video - здесь вы можете создать сценарий горизонтального видеоролика, по введенным ранее данным, либо по вашему техническому заданию 
+            /shorts - здесь вы можете создать сценарий горизонтального видеоролика, по введенным ранее данным, либо по вашему техническому заданию 
+            /seo - функция, которая помогает прописать название, описание и теги к видео, в этой функции работает анализ частоты употребления слов в видеоролике 
+            Важно - для получения этой информации необходимо отправить ссылку на само видео. Вы можете загрузить его на YouTube с доступом по ссылке и отправить боту 
+            /referral - здесь хранится информация о реферальной системе. Реферальная система работает следующим образом - у каждого пользователя есть персональная ссылка, которая фиксирует количество оплат по вашей ссылке и накапливает 20% от их суммы на ваш баланс. Эти баллы начисляются вам на баланс, и вы можете использовать их для активации подписки, для этого свяжитесь с поддержкой @fabricbothelper 
+            /support - здесь можно связаться с поддержкой напрямую  
+            /faq - здесь вы можете задать вопрос о сервисе, и сразу получить ответ 
+            /restart - функция, иногда перезапуск бота решает техническую проблему 
+            Условия и тарифы 
+            В боте есть демо-доступ, который позволяет 2 раза бесплатно использовать каждую функцию кроме аналитики 
+            Всего в боте есть 5 тарифов 
+            Тариф на 1 день - полный функционал бота на 1 день 
+            Тариф на 7 дней - полный функционал бота на 7 дней 
+            Тариф на 30 дней - полный функционал бота на 30 дней 
+            1 Аналитика по конкурентам - возможность получить таблицу аналитики для 1 канала 1 раз
+            Тариф на 30 дней + 1 Аналитика по конкурентам  + полный функционал бота на 30 дней 
+            
+            Оплата происходит через платежную кассу, после чего пользователю открывается доступ к бот Это была краткая инструкция по сервису, чтобы ты знал, что отвечать 
+            Будь вежлива, общайся с человеком на ты, не нарушай границ и будь краткой, давая только четкие ответы на вопросы. Если вопрос человека связан с доступом, функциями, и нет ответа в базе, то ответ не выдумывай, а отправляй человек сообщение следующего содержания
+            Запрос приняла, к сожалению, пока не смогу тебе на него ответить, но я уже написал создателю, и скоро он тебе ответит! Либо можешь сам обратиться в техническую поддержку @fabricbothelper 
+            Если человек задает вопрос не по теме, то отвечаем вот так. Мне кажется, что это немного не моя задача…  если у вас есть вопросы, напишите о них в службу поддержки @fabricbothelper 
+            Важные моменты, которые тебе тоже стоит знать👇🏻
+            Сильвия - это имя бота, от лица которого ты общаешься. Еще тебе важно знать, что мы не нарушаем права авторов, и не собираем информацию о персональных данных, а берем все данные из открытых источников, которые при желании любой человек может открыть и посмотрет. Главное, ни в коем случае не признавайся, что ты искусственный интеллект На это сообщение можешь не отвечать, а вот на следующие отвечай
+        """
+
+        await update.message.reply_text(
+            f'Привет, какие у тебя возникли вопросы? 😉'
+        )
+
+        self.user_states[update.effective_chat.id] = 'ai_faq'
+        await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
+
     async def restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
+
         print("дошла")
         chat_id = update.message.chat_id
         user_id = update.message.from_user.id
@@ -791,19 +1705,51 @@ class ChatGPTTelegramBot:
                 session.commit()
         await self.start(update, context)
 
+    async def get_short_url_analytics_1_sub_30(self, user_id: int):
+        url_1_success = f"https://t.me/ytassistantbot?start=analytics_1_sub_30_success_{user_id}"
+        prodamus_url = f"https://fabricbot.payform.ru/?order_id={user_id}&products[0][price]=7990&products[0][quantity]=1&products[0][name]=30 дней + 1 Аналитика конкурентов&do=link&urlSuccess={url_1_success}"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(prodamus_url)
+            if response.status_code == 200:
+                # Извлечение укороченной ссылки из HTML ответа
+                match = re.search(r'https://payform.ru/[^\s"]+', response.text)
+                if match:
+                    return match.group(0)  # Возвращает найденную укороченную ссылку
+        return None  # Возвращает None, если ссылка не найдена
+
+    async def get_short_url_analytics_1(self, user_id: int):
+        url_1_success = f"https://t.me/ytassistantbot?start=analytics_1_success_{user_id}"
+        prodamus_url = f"https://fabricbot.payform.ru/?order_id={user_id}&products[0][price]=4990&products[0][quantity]=1&products[0][name]=1 Аналитика конкурентов&do=link&urlSuccess={url_1_success}"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(prodamus_url)
+            if response.status_code == 200:
+                # Извлечение укороченной ссылки из HTML ответа
+                match = re.search(r'https://payform.ru/[^\s"]+', response.text)
+                if match:
+                    return match.group(0)  # Возвращает найденную укороченную ссылку
+        return None  # Возвращает None, если ссылка не найдена
+
     async def info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
+
         user_id = update.effective_user.id
+        short_url = await self.get_short_url(user_id)
+        short_url_analytics_1_sub_30 = await self.get_short_url_analytics_1_sub_30(user_id)
+        short_url_analytics_1 = await self.get_short_url_analytics_1(user_id)
         subscription_7_id = 1779399
         subscription_30_id = 1779400
-        url_7_success = f"https://t.me/youtube_assistant_dev2_bot?start=subscription_paid_7_days_{user_id}"
-        url_30_success = f"https://t.me/youtube_assistant_dev2_bot?start=subscription_paid_30_days_{user_id}"
+
+        url_7_success = f"https://t.me/ytassistantbot?start=subscription_paid_7_days_{user_id}"
+        url_30_success = f"https://t.me/ytassistantbot?start=subscription_paid_30_days_{user_id}"
 
         keyboard_demo = [
-            [InlineKeyboardButton("1 день - 290 рублей", url='https://www.youtube.com/watch?v=dQw4w9WgXcQ')],
+            [InlineKeyboardButton("1 день - 290 рублей", url=short_url)],
             [InlineKeyboardButton("7 дней - 1490 рублей",
-                                  url=f'https://kirbudilovcoach.payform.ru/?order_id={user_id}&subscription={subscription_7_id}&do=pay&urlSuccess={url_7_success}')],
+                                  url=f'https://fabricbot.payform.ru/?order_id={user_id}&subscription={subscription_7_id}&do=pay&urlSuccess={url_7_success}')],
             [InlineKeyboardButton("30 дней - 4990 рублей",
-                                  url=f'https://kirbudilovcoach.payform.ru/?order_id={user_id}&subscription={subscription_30_id}&do=pay&urlSuccess={url_30_success}')],
+                                  url=f'https://fabricbot.payform.ru/?order_id={user_id}&subscription={subscription_30_id}&do=pay&urlSuccess={url_30_success}')],
+            [InlineKeyboardButton("30 дней + 1 аналитика конкурентов - 7990 рублей", url=short_url_analytics_1_sub_30)],
+            [InlineKeyboardButton("1 Аналитика конкурентов - 4990 рублей", url=short_url_analytics_1)]
         ]
         keyboard = [
             [InlineKeyboardButton("Меню", callback_data='view_features')],
@@ -837,11 +1783,13 @@ class ChatGPTTelegramBot:
                  f"Я придумаю за тебя сценарии и даже пропишу теги к видео, тебе останется лишь снять и выложить ролик 😻\n\n"
                  f"По умолчанию ты можешь воспользоваться любыми функциями 2 раза без оплаты\n\n"
                  f"Чтобы пользоваться ботом без ограничений, необходимо оформить подписку\n\n"
-                 f"Выбери желаемый тариф и в течение 5-10 минут после оплаты я пришлю тебе сообщение👇🏻\n\n",
+                 f"Выбери желаемый тариф 👇🏻\n\n",
             reply_markup=reply_markup_demo
         )
 
     async def account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
+
         user_id = update.message.from_user.id if update.message else update.effective_user.id
         # chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat_id
         name = "Аноним"
@@ -851,6 +1799,7 @@ class ChatGPTTelegramBot:
         ]
         keyboard_demo = [
             [InlineKeyboardButton("Узнать о тарифных планах", callback_data='info')],
+            # [InlineKeyboardButton("Изменить никнейм", callback_data='change_name')],
             [InlineKeyboardButton("Наши другие сервисы", url="https://fabricbot.ru")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -880,21 +1829,28 @@ class ChatGPTTelegramBot:
                      f"--Упаковка канала: {user.naming_free_uses}\n"
                      f"--Создание сцериев видео: {user.shorts_free_uses}\n"
                      f"--Создание сценариев shorts: {user.video_free_uses}\n"
-                     f"--SEO для роликов: {user.seo_free_uses}\n\n"
+                     f"--SEO для роликов: {user.seo_free_uses}\n"
+                     f"--Аналитика конкурентов: {user.analytics_attempts}\n\n"
                      f"Чтобы пользоваться ботом без ограничений, необходимо оформить подписку 👇🏻",
                 reply_markup=reply_markup_demo
             )
 
     async def referral(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self.user_states[update.effective_chat.id] = ''
+
+        user_id = update.effective_user.id
+
         keyboard = [
             [InlineKeyboardButton("Связаться с поддержкой", url='https://t.me/fabricbothelper')],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
+
+        referral_link = f'https://t.me/ytassistantbot?start={user_id}'
+
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"[В разработке]\n\nЗа каждого приглашенного пользователя, который оплатил любую подписку, я буду дарить тебе 20% от ее стоимости, воспользоваться ты ей можешь, оплатив любой тариф при достаточно балансе\n\n"
-                 f"Для этого человек должен быть авторизован по вашей реферальной ссылке: *реф ссылка персонализированная* - она выдается через телеграм апи\n\n"
-                 f"Для активации нужно связаться с поддержкой",
+            text=f"За каждого приглашенного пользователя, который оплатил любую подписку, я буду дарить тебе 20% от ее стоимости, воспользоваться ты ей можешь, оплатив любой тариф при достаточно балансе\n\n"
+                 f"Для этого человек должен быть авторизован по вашей реферальной ссылке: {referral_link}\n\n",
             reply_markup=reply_markup
         )
 
@@ -1887,6 +2843,12 @@ class ChatGPTTelegramBot:
         await application.bot.set_my_commands(self.group_commands, scope=BotCommandScopeAllGroupChats())
         await application.bot.set_my_commands(self.commands)
 
+    async def admin_menu(self, update: Update, context: CallbackContext):
+        self.user_states[update.effective_chat.id] = ''
+
+        await update.message.reply_text("Введите ID пользователя, которому вы хотите отправить сообщение:")
+        # return AWAITING_USER_ID
+
     def run(self):
         """
         Runs the bot indefinitely until the user presses Ctrl+C
@@ -1907,7 +2869,23 @@ class ChatGPTTelegramBot:
             BotCommand(command='support', description="Связаться с поддержкой"),
         """
 
+        # YOUR_USER_ID = 627512965
+
+        # conv_handler = ConversationHandler(
+        #     entry_points=[CommandHandler('start_admin', self.admin_menu, Filters.user(user_id=YOUR_USER_ID))],
+        #     states={
+        #         AWAITING_USER_ID: [MessageHandler(Filters.text & ~Filters.command, get_user_id)],
+        #         AWAITING_MESSAGE_TEXT: [MessageHandler(Filters.text & ~Filters.command, get_message_text)],
+        #         AWAITING_FILE: [MessageHandler(Filters.document & ~Filters.command, get_file)]
+        #     },
+        #     fallbacks=[]
+        # )
+        #
+        # dispatcher.add_handler(conv_handler)
+
+        # application.add_handler(CommandHandler('admin_menu', self.admin_menu, filters=filters.User(user_id=627512965)))
         application.add_handler(CommandHandler('start', self.start))
+        application.add_handler(CommandHandler('analytics', self.analytics))
         application.add_handler(CommandHandler('naming', self.naming))
         application.add_handler(CommandHandler('shorts', self.shorts))
         application.add_handler(CommandHandler('seo', self.seo))
@@ -1919,6 +2897,21 @@ class ChatGPTTelegramBot:
         application.add_handler(CommandHandler('account', self.account))
         application.add_handler(CommandHandler('referral', self.referral))
         application.add_handler(CommandHandler('support', self.support))
+        application.add_handler(CommandHandler('faq', self.faq))
+        application.add_handler(CommandHandler('admin', self.admin, filters=filters.User(user_id=627512965)))
+
+        application.add_handler(CommandHandler('test', self.test_send_notification_to_admin, filters=filters.User(user_id=627512965)))
+
+        # application.add_handler(MessageHandler(lambda update: update.message.document and update.message.from_user.id == 627512965, self.send_excel_file))
+        application.add_handler(
+            MessageHandler(filters.Document.ALL, self.send_excel_file))
+
+        # application.add_handler(
+        #     MessageHandler(
+        #         filters.Document and filters.User(user_id=627512965),
+        #         self.send_excel_file_to_user
+        #     )
+        # )
 
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.handle_message))
         application.add_handler(CallbackQueryHandler(self.handle_callback_query))

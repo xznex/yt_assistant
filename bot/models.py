@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, BigInteger, ForeignKey, DateTime
+from sqlalchemy import Column, Integer, String, BigInteger, ForeignKey, DateTime, Text
 from sqlalchemy.orm import relationship
 
 from database import Base
@@ -12,10 +12,21 @@ class User(Base):
     name = Column(String, index=True)
     channel_description = Column(String)
     channel_idea = Column(String)
+
+    analytics_channel_description = Column(Text)
+    analytics_channel_audience = Column(Text)
+    analytics_channel_goals = Column(Text)
+    analytics_words = Column(Text)
+    analytics_links = Column(Text)
+    analytics_channel_characteristics = Column(Text)
+
     naming_free_uses = Column(Integer, default=2)
     shorts_free_uses = Column(Integer, default=2)
     video_free_uses = Column(Integer, default=2)
     seo_free_uses = Column(Integer, default=2)
+
+    analytics_attempts = Column(Integer, default=0)
+
     subscriptions = relationship("Subscription", back_populates="user")  # Добавляем отношение к подпискам
 
 
